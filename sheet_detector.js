@@ -44,6 +44,15 @@ export class SheetDetector {
     this.video.muted = true;
     this.video.playsInline = true;
 
+    const preview = document.querySelector("#camera-feed");
+    if (preview) {
+      preview.srcObject = null;
+      preview.width = this.width;
+      preview.height = this.height;
+      preview.muted = true;
+      preview.playsInline = true;
+    }
+
     const isFacingMode = this.camera === "user" || this.camera === "environment";
     const videoConstraint = isFacingMode
       ? { facingMode: this.camera, width: this.width, height: this.height }
@@ -54,6 +63,11 @@ export class SheetDetector {
       audio: false,
     });
     this.video.srcObject = this.stream;
+    if (preview) {
+      preview.srcObject = this.stream;
+      preview.muted = true;
+      await preview.play();
+    }
     await this.video.play();
 
     // Use the camera's actual resolution if it differs from the requested one.
@@ -152,9 +166,9 @@ export class SheetDetector {
             size: { width, height },
             angle: rect.angle,
             area,
-            // rectangularity,
-            // aspectRatio,
-            // corners: this.#rectangleCorners(rect),
+            rectangularity,
+            aspectRatio,
+            corners: this.#rectangleCorners(rect),
           });
         } finally {
           contour.delete();
@@ -168,23 +182,23 @@ export class SheetDetector {
     return found;
   }
 
-//   #rectangleCorners(rect) {
-//     const radians = (rect.angle * Math.PI) / 180;
-//     const cosine = Math.cos(radians);
-//     const sine = Math.sin(radians);
-//     const halfWidth = rect.size.width / 2;
-//     const halfHeight = rect.size.height / 2;
+  #rectangleCorners(rect) {
+    const radians = (rect.angle * Math.PI) / 180;
+    const cosine = Math.cos(radians);
+    const sine = Math.sin(radians);
+    const halfWidth = rect.size.width / 2;
+    const halfHeight = rect.size.height / 2;
 
-//     return [
-//       [-halfWidth, -halfHeight],
-//       [halfWidth, -halfHeight],
-//       [halfWidth, halfHeight],
-//       [-halfWidth, halfHeight],
-//     ].map(([x, y]) => ({
-//       x: rect.center.x + x * cosine - y * sine,
-//       y: rect.center.y + x * sine + y * cosine,
-//     }));
-//   }
+    return [
+      [-halfWidth, -halfHeight],
+      [halfWidth, -halfHeight],
+      [halfWidth, halfHeight],
+      [-halfWidth, halfHeight],
+    ].map(([x, y]) => ({
+      x: rect.center.x + x * cosine - y * sine,
+      y: rect.center.y + x * sine + y * cosine,
+    }));
+  }
 
   #processNextFrame() {
     if (!this.running || !this.capture || !this.background) return;
