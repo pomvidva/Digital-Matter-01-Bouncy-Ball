@@ -23,7 +23,7 @@ As long as both of you stick to this shape, you can work at the same time withou
 
 ## 👤 Person A: "Eyes" (camera + calibration), **me**
 
-**Owns:** `note_detector.js`, new `calibration.js`. Avoid editing `index.html` (B owns it).
+**Owns:** `core/note_detector.js`, `core/calibration.js`. Avoid editing `core/core.js` (B owns it).
 **Branch:** `eyes`
 
 - [x] **A1. Catch red-leaning pink.** Hue wraps around (…178, 179, 0, 1…). Second hue window `detector.hue2 = [0, 10]` (shares S/V with the main range; `null` turns it off), combined with `cv.bitwise_or`.
@@ -36,7 +36,7 @@ As long as both of you stick to this shape, you can work at the same time withou
 
 ## 👤 Person B: "World" (physics + show), **teammate**
 
-**Owns:** `index.html` (optionally split the script out into `world.js`).
+**Owns:** `core/core.js` (was the script inside `index.html`).
 **Branch:** `world`
 
 - [ ] **B1. Fake notes.** Drag with the mouse to create test notes in the contract shape, so no camera is needed yet.

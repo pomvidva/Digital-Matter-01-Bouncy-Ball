@@ -26,10 +26,10 @@
   <canvas id="c"></canvas>
   <div id="info">loading OpenCV…</div>
 
-  <script src="../opencv.js"></script>
+  <script src="../core/opencv.js"></script>
   <script type="module">
-    import { NoteDetector } from "../note_detector.js";
-    import { Calibration, solveHomography, applyHomography } from "../calibration.js";
+    import { NoteDetector } from "../core/note_detector.js";
+    import { Calibration, solveHomography, applyHomography } from "../core/calibration.js";
 
     const canvas = document.getElementById("c");
     const ctx = canvas.getContext("2d");

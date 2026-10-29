@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cup Game</title>
+  <link rel="stylesheet" href="core/core.css" />
+</head>
+<body>
+  <!-- a project: the foundation + its own rules (projects/cup-game.js) -->
+  <script src="core/opencv.js"></script>
+  <script src="core/matter.min.js"></script>
+  <script type="module">
+    import { start } from "./core/core.js";
+    import cupGame from "./projects/cup-game.js";
+    start({ project: cupGame });
+  </script>
+</body>
+</html>

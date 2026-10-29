@@ -1,0 +1,526 @@
+// The foundation every page builds on: camera + note detection, calibration,
+// note bodies, Matter.js world, fixed-timestep physics, tuner panel, draw loop.
+//
+//   start()                  -> the plain bouncy ball (sandbox)
+//   start({ project })       -> the same, plus the project's rules on top
+//
+// The page links core/core.css and loads opencv.js and matter.min.js (classic
+// scripts) before this module. See game.html for the whole page.
+//
+// A project is an object; every hook is optional:
+//   title                    page + panel title
+//   help                     HTML for the panel's key list (replaces the sandbox's
+//                            "click drop ball · space drop at top" line)
+//   setup(core)              once, before the first frame. core = { Matter, engine,
+//                            world, canvas, ctx, view, dropBall(x, y), clearBalls() }
+//   resize(w, h)             canvas size changed (also called once after setup)
+//   update(now)              every frame, after physics
+//   draw(ctx, now)           every frame, after notes and balls are drawn
+//   onKey(e)                 return true = handled, core skips its own key action
+//   onPointer(e)             left click (not calibration, not shift+drag);
+//                            return true = handled, core won't drop a ball
+//   onNoteHit(note, ball, speed)   a ball started touching a note body
+
+import { NoteDetector } from "./note_detector.js";
+import projects from "../projects.js";
+
+export function start({ project = {} } = {}) {
+  if (project.title) document.title = project.title;
+
+  document.body.insertAdjacentHTML("afterbegin", `
+    <canvas id="c"></canvas>
+    <canvas id="mask"></canvas>
+
+    <div id="panel">
+      <h1>${project.title ?? "🎀 Pink note tuner"}</h1>
+      <div id="pages"></div>
+      <div id="stat">notes: 0 · balls: 0</div>
+      <div class="row"><label>H min</label><input id="hmin" type="range" min="0" max="179" value="140"><span id="hminV">140</span></div>
+      <div class="row"><label>H max</label><input id="hmax" type="range" min="0" max="179" value="179"><span id="hmaxV">179</span></div>
+      <div class="row"><label>H2 min</label><input id="h2min" type="range" min="0" max="179" value="0"><span id="h2minV">0</span></div>
+      <div class="row"><label>H2 max</label><input id="h2max" type="range" min="0" max="179" value="10"><span id="h2maxV">10</span></div>
+      <div class="row"><label>S min</label><input id="smin" type="range" min="0" max="255" value="70"><span id="sminV">70</span></div>
+      <div class="row"><label>S max</label><input id="smax" type="range" min="0" max="255" value="255"><span id="smaxV">255</span></div>
+      <div class="row"><label>V min</label><input id="vmin" type="range" min="0" max="255" value="70"><span id="vminV">70</span></div>
+      <div class="row"><label>V max</label><input id="vmax" type="range" min="0" max="255" value="255"><span id="vmaxV">255</span></div>
+      <div class="keys">
+        ${project.help ?? "<b>click</b> drop ball · <b>space</b> drop at top"}<br>
+        <b>shift+drag</b> fake note · <b>right-click</b> delete it · <b>n</b> clear fakes<br>
+        <b>m</b> mask view · <b>v</b> feed · <b>o</b> outlines<br>
+        <b>p</b> projector mode · <b>h</b> hide panel<br>
+        <b>c</b> calibrate · <b>shift+c</b> cancel (or reset saved)<br>
+        <b>x</b> clear balls · <b>f</b> fullscreen
+      </div>
+    </div>
+  `);
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const maskCanvas = document.getElementById("mask");
+  const stat = document.getElementById("stat");
+
+  const panel = document.getElementById("panel");
+
+  const view = { showFeed: true, showMask: false, mirror: true, projector: false, outlines: true, panel: true };
+
+  // ---------- links to the other pages ----------
+  // /game, /game.html and /index.html all count as "this page"
+  const pageKey = (u) => new URL(u, location.href).pathname.replace(/(index)?(\.html)?$/, "");
+  const root = new URL("../", import.meta.url);
+  for (const p of projects) {
+    const a = document.createElement("a");
+    a.href = new URL(p.path, root);
+    a.textContent = p.name;
+    if (pageKey(a.href) === pageKey(location.href)) a.className = "here";
+    document.getElementById("pages").append(a);
+  }
+
+  // ---------- calibration hooks (B6) ----------
+  // calibration.js is Person A's. Loaded optionally so this page works without it.
+  // API: start(video, camW, camH), draw(ctx), handleClick/handleMove(x, y), handleKey(key),
+  //      active, camToProj(p, w, h), isCalibrated, clear()
+  let calibration = null;
+  let calibrating = false;
+  import("./calibration.js")
+    .then((m) => { calibration = new m.Calibration(); })
+    .catch(() => { /* not written yet */ });
+
+  // ---------- Matter.js world ----------
+  const { Engine, Bodies, Body, Composite } = Matter;
+  const engine = Engine.create();
+  engine.gravity.y = 2; // canvas is large in px, so 1 felt floaty
+  const world = engine.world;
+
+  let walls = [];
+  let noteBodies = [];
+
+  function rebuildWalls() {
+    Composite.remove(world, walls);
+    const w = canvas.width, h = canvas.height, t = 200;
+    walls = [
+      Bodies.rectangle(w / 2, -t / 2, w * 2, t, { isStatic: true }),          // top (open-ish, high up)
+      Bodies.rectangle(w / 2, h + t / 2, w * 2, t, { isStatic: true, restitution: 0.7 }), // floor
+      Bodies.rectangle(-t / 2, h / 2, t, h * 2, { isStatic: true, restitution: 0.7 }),     // left
+      Bodies.rectangle(w + t / 2, h / 2, t, h * 2, { isStatic: true, restitution: 0.7 }),  // right
+    ];
+    Composite.add(world, walls);
+    project.resize?.(w, h);
+  }
+
+  function dropBall(x, y) {
+    const ball = Bodies.circle(x, y, 20, {
+      restitution: 0.8, friction: 0.02, frictionAir: 0.002, density: 0.001,
+      render: {}, label: "ball",
+    });
+    Composite.add(world, ball);   // no sideways push: it falls straight down
+    // cap total balls
+    const balls = Composite.allBodies(world).filter(b => b.label === "ball");
+    if (balls.length > 40) Composite.remove(world, balls[0]);
+    return ball;
+  }
+
+  function clearBalls() {
+    Composite.remove(world, Composite.allBodies(world).filter(b => b.label === "ball"));
+  }
+
+  // ball <-> note contacts, for projects (sounds, glow, scoring...)
+  Matter.Events.on(engine, "collisionStart", (e) => {
+    if (!project.onNoteHit) return;
+    for (const { bodyA: a, bodyB: b } of e.pairs) {
+      const note = a.label === "note" ? a : b.label === "note" ? b : null;
+      const ball = a.label === "ball" ? a : b.label === "ball" ? b : null;
+      if (note && ball) project.onNoteHit(note, ball, ball.speed);
+    }
+  });
+
+  // ---------- camera->canvas mapping (contain + optional mirror) ----------
+  let layout = { s: 1, ox: 0, oy: 0, camW: 1, camH: 1 };
+  function computeLayout(camW, camH) {
+    const s = Math.min(canvas.width / camW, canvas.height / camH);
+    layout = { s, ox: (canvas.width - camW * s) / 2, oy: (canvas.height - camH * s) / 2, camW, camH };
+  }
+  const mapX = (x) => view.mirror ? layout.ox + (layout.camW - x) * layout.s : layout.ox + x * layout.s;
+  const mapY = (y) => layout.oy + y * layout.s;
+
+  // ---------- note tracking (B2) ----------
+  // Keep one body per physical note and move it, instead of deleting and
+  // re-creating it every frame (which made balls resting on it jitter/fall).
+  const MATCH_DIST = 60;   // px: max distance to count as "the same note"
+  const MAX_MISSING = 5;   // detections a note may vanish before its body is removed
+  const MIN_NOTE = 12;     // px: minimum note thickness
+  let tracks = [];         // { body, missing }
+  let purge = false;       // true -> unmatched bodies are removed at once (a fake note was deleted)
+  let lastNotes = null;   // detector.notes is a new array per detection -> identity change = new detection
+
+  // Matter's Body.setVertices/scale break a static body's infinite mass, so we
+  // write the rectangle's geometry into the body ourselves.
+  function setRect(body, cx, cy, w, h, angle) {
+    const cos = Math.cos(angle), sin = Math.sin(angle);
+    const local = [[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]];
+    body.vertices.forEach((v, i) => {
+      v.x = cx + local[i][0] * cos - local[i][1] * sin;
+      v.y = cy + local[i][0] * sin + local[i][1] * cos;
+    });
+    body.position.x = body.positionPrev.x = cx;
+    body.position.y = body.positionPrev.y = cy;
+    body.angle = body.anglePrev = angle;
+    body.axes = Matter.Axes.fromVertices(body.vertices);
+    Matter.Bounds.update(body.bounds, body.vertices, body.velocity);
+  }
+
+  // ---------- notes in screen px (the A -> B contract) ----------
+  // A note is { corners: [{x,y} x4], center: {x,y} } in screen/projector pixels.
+
+  // camera px -> screen px: calibrated homography if available, else fit + mirror
+  function camToScreen(p) {
+    if (calibration?.isCalibrated) return calibration.camToProj(p, canvas.width, canvas.height);
+    return { x: mapX(p.x), y: mapY(p.y) };
+  }
+
+  // detector note (camera px) -> contract note. Uses n.corners if the detector
+  // provides them (A2), otherwise rebuilds them from center/size/angle.
+  function toScreenNote(n) {
+    let cam = n.corners;
+    if (!cam) {
+      const a = n.angle * Math.PI / 180, cos = Math.cos(a), sin = Math.sin(a);
+      const hw = n.size.width / 2, hh = n.size.height / 2;
+      cam = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => (
+        { x: n.center.x + x * cos - y * sin, y: n.center.y + x * sin + y * cos }));
+    }
+    return { corners: cam.map(camToScreen), center: camToScreen(n.center) };
+  }
+
+  // contract note -> rectangle for the physics body (x, y, w, h, angle)
+  function noteGeom(n) {
+    const [a, b, c] = n.corners;
+    return [
+      n.center.x, n.center.y,
+      Math.max(MIN_NOTE, Math.hypot(b.x - a.x, b.y - a.y)),   // >= 12px so balls can't tunnel
+      Math.max(MIN_NOTE, Math.hypot(c.x - b.x, c.y - b.y)),
+      Math.atan2(b.y - a.y, b.x - a.x),
+    ];
+  }
+
+  // ---------- fake notes (B1): shift+drag a line, it becomes a note along that line ----------
+  const FAKE_THICKNESS = 40;
+  let fakeNotes = [];
+  let drag = null;   // { x0, y0, x1, y1 } while shift-dragging
+
+  function makeFakeNote(x0, y0, x1, y1) {
+    const len = Math.max(30, Math.hypot(x1 - x0, y1 - y0));
+    const ang = Math.atan2(y1 - y0, x1 - x0);
+    const ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, hl = len / 2, ht = FAKE_THICKNESS / 2;
+    return {
+      center: { x: cx, y: cy },
+      corners: [[-hl, -ht], [hl, -ht], [hl, ht], [-hl, ht]].map(([l, t]) => (
+        { x: cx + ux * l + vx * t, y: cy + uy * l + vy * t })),
+    };
+  }
+
+  // detector notes + fake notes, rebuilt only when something changed
+  let combined = [], combinedKey = null, fakesDirty = true;
+  function currentNotes() {
+    const key = detector.notes;
+    const calKey = !!calibration?.isCalibrated;
+    if (key !== combinedKey || fakesDirty || calKey !== currentNotes.calKey) {
+      combinedKey = key; fakesDirty = false; currentNotes.calKey = calKey;
+      combined = [...(detector.notes || []).map(toScreenNote), ...fakeNotes];
+    }
+    return combined;
+  }
+
+  function syncNoteBodies(notes) {
+    if (notes === lastNotes) return;   // nothing new since last frame
+    lastNotes = notes;
+
+    // 1. all (track, note) pairs close enough, nearest first
+    const pairs = [];
+    tracks.forEach((t, ti) => notes.forEach((n, ni) => {
+      const d = Math.hypot(t.body.position.x - n.center.x, t.body.position.y - n.center.y);
+      if (d < MATCH_DIST) pairs.push({ ti, ni, d });
+    }));
+    pairs.sort((a, b) => a.d - b.d);
+
+    // 2. greedily assign; each track and each note used at most once
+    const usedT = new Set(), usedN = new Set();
+    for (const { ti, ni } of pairs) {
+      if (usedT.has(ti) || usedN.has(ni)) continue;
+      usedT.add(ti); usedN.add(ni);
+      setRect(tracks[ti].body, ...noteGeom(notes[ni]));
+      tracks[ti].missing = 0;
+    }
+
+    // 3. unmatched tracks -> count a miss; remove after MAX_MISSING
+    tracks = tracks.filter((t, ti) => {
+      if (usedT.has(ti)) return true;
+      if (purge || ++t.missing > MAX_MISSING) { Composite.remove(world, t.body); return false; }
+      return true;
+    });
+    purge = false;
+
+    // 4. unmatched notes -> new bodies
+    notes.forEach((n, ni) => {
+      if (usedN.has(ni)) return;
+      const g = noteGeom(n);
+      const body = Bodies.rectangle(g[0], g[1], g[2], g[3], { isStatic: true, restitution: 0.9, label: "note" });
+      setRect(body, ...g);
+      Composite.add(world, body);
+      tracks.push({ body, missing: 0 });
+    });
+    noteBodies = tracks.map((t) => t.body);
+  }
+
+  // ---------- detector ----------
+  const detector = new NoteDetector({
+    camera: "user",
+    debugCanvas: maskCanvas,
+    lower: [140, 70, 70],
+    upper: [179, 255, 255],
+  });
+
+  // ---------- tuner wiring ----------
+  // saved per site, so every page shares the same color settings
+  const ids = ["hmin","hmax","h2min","h2max","smin","smax","vmin","vmax"];
+  const TUNER_KEY = "bouncy.tuner";
+  function readTuner() {
+    const g = (id) => +document.getElementById(id).value;
+    detector.lower = [g("hmin"), g("smin"), g("vmin")];
+    detector.upper = [g("hmax"), g("smax"), g("vmax")];
+    // second hue range (pink that wraps past 179 into 0..); shares S/V with the first
+    detector.hue2 = [g("h2min"), g("h2max")];
+  }
+  function saveTuner() {
+    try {
+      localStorage.setItem(TUNER_KEY, JSON.stringify(Object.fromEntries(
+        ids.map((id) => [id, document.getElementById(id).value]))));
+    } catch { /* storage blocked: sliders just won't persist */ }
+  }
+  function loadTuner() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(TUNER_KEY) || "{}");
+      for (const id of ids) {
+        if (saved[id] === undefined) continue;
+        document.getElementById(id).value = saved[id];
+        document.getElementById(id + "V").textContent = saved[id];
+      }
+    } catch { /* ignore corrupt/blocked storage */ }
+  }
+  ids.forEach((id) => {
+    const el = document.getElementById(id);
+    const out = document.getElementById(id + "V");
+    el.addEventListener("input", () => { out.textContent = el.value; readTuner(); saveTuner(); });
+  });
+  loadTuner();
+
+  // ---------- fixed-timestep physics ----------
+  // Step by real elapsed time so speed doesn't depend on display refresh rate or
+  // on frames lost to OpenCV; small steps keep fast balls from tunnelling.
+  const STEP_MS = 1000 / 120, MAX_STEPS = 8, MAX_SPEED = 25; // MAX_SPEED: px per step
+  let lastT = 0, acc = 0;
+  function stepPhysics(now) {
+    acc += Math.min(now - (lastT || now), STEP_MS * MAX_STEPS);
+    lastT = now;
+    const balls = Composite.allBodies(world).filter(b => b.label === "ball");
+    while (acc >= STEP_MS) {
+      Engine.update(engine, STEP_MS);
+      for (const b of balls) {
+        const sp = Math.hypot(b.velocity.x, b.velocity.y);
+        if (sp > MAX_SPEED) Body.setVelocity(b, { x: b.velocity.x * MAX_SPEED / sp, y: b.velocity.y * MAX_SPEED / sp });
+      }
+      acc -= STEP_MS;
+    }
+  }
+
+  let flash = "";   // one-off message shown under the stats (errors, missing calibration.js)
+  const perf = { frames: 0, detects: 0, t0: performance.now(), lastNotes: null, text: "" };
+
+  // ---------- draw loop ----------
+  function frame() {
+    if (canvas.width !== innerWidth || canvas.height !== innerHeight) {
+      canvas.width = innerWidth; canvas.height = innerHeight;
+      maskCanvas.width = innerWidth; maskCanvas.height = innerHeight;
+      rebuildWalls();
+    }
+    if (detector.width) computeLayout(detector.width, detector.height);
+    syncNoteBodies(currentNotes());
+
+    stepPhysics(performance.now());
+    project.update?.(performance.now());
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (view.projector) { ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+
+    // background: camera feed or mask (never in projector mode: the camera must not
+    // see its own picture projected back on the wall)
+    if (view.projector) {
+      // black
+    } else if (view.showMask) {
+      ctx.save(); ctx.globalAlpha = 0.9;
+      drawContain(maskCanvas);
+      ctx.restore();
+    } else if (view.showFeed && detector.video && detector.video.readyState >= 2) {
+      ctx.save(); ctx.globalAlpha = 0.4;
+      drawContain(detector.video);
+      ctx.restore();
+    }
+
+    // note collision boxes. Cyan, never pink: the camera would detect projected
+    // pink as a note, and that fake note would never go away.
+    if (view.outlines) {
+      ctx.lineWidth = 3; ctx.strokeStyle = "#00e5ff";
+      for (const b of noteBodies) drawBody(b);
+    }
+
+    // fake note being dragged
+    if (drag) {
+      ctx.save(); ctx.setLineDash([8, 8]); ctx.lineWidth = 2; ctx.strokeStyle = "#00e5ff";
+      ctx.beginPath(); ctx.moveTo(drag.x0, drag.y0); ctx.lineTo(drag.x1, drag.y1); ctx.stroke();
+      ctx.restore();
+    }
+
+    // balls
+    for (const b of Composite.allBodies(world)) {
+      if (b.label !== "ball") continue;
+      ctx.beginPath();
+      ctx.arc(b.position.x, b.position.y, b.circleRadius, 0, Math.PI * 2);
+      ctx.fillStyle = "#fff"; ctx.fill();
+    }
+
+    if (project.draw) { ctx.save(); project.draw(ctx, performance.now()); ctx.restore(); }
+
+    const nBalls = Composite.allBodies(world).filter(b => b.label === "ball").length;
+    // fps counters, refreshed once a second
+    perf.frames++;
+    if (detector.notes !== perf.lastNotes) { perf.detects++; perf.lastNotes = detector.notes; }
+    const t = performance.now();
+    if (t - perf.t0 >= 1000) {
+      perf.text = `draw ${perf.frames} fps · detect ${perf.detects} fps`;
+      perf.frames = perf.detects = 0; perf.t0 = t;
+    }
+    stat.textContent = `notes: ${noteBodies.length} · balls: ${nBalls} · ${perf.text}` + (flash ? `\n${flash}` : "");
+
+    if (calibrating && calibration) calibration.draw(ctx);
+
+    requestAnimationFrame(frame);
+  }
+
+  function drawContain(src) {
+    ctx.save();
+    if (view.mirror) { ctx.translate(canvas.width, 0); ctx.scale(-1, 1); }
+    const dx = view.mirror ? canvas.width - layout.ox - layout.camW * layout.s : layout.ox;
+    ctx.drawImage(src, dx, layout.oy, layout.camW * layout.s, layout.camH * layout.s);
+    ctx.restore();
+  }
+
+  function drawBody(b) {
+    const v = b.vertices;
+    ctx.beginPath();
+    ctx.moveTo(v[0].x, v[0].y);
+    for (let i = 1; i < v.length; i++) ctx.lineTo(v[i].x, v[i].y);
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  // ---------- input ----------
+  // projector mode hides the panel and cursor; `h` can still toggle the panel after
+  function applyUI() {
+    // the panel would cover calibration dot 1, so it hides while calibrating
+    panel.style.display = view.panel && !calibrating ? "" : "none";
+    canvas.style.cursor = view.projector && !calibrating ? "none" : "";
+  }
+
+  // calibration finishes itself after the 4th valid click, or on Esc
+  function syncCalibrating() {
+    if (calibrating && !calibration.active) { calibrating = false; applyUI(); }
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    if (calibrating && calibration) {            // clicks belong to calibration while it runs
+      calibration.handleClick(e.clientX, e.clientY);
+      syncCalibrating();
+    } else if (e.shiftKey) {                     // B1: start a fake note
+      drag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY };
+      canvas.setPointerCapture(e.pointerId);
+    } else if (!project.onPointer?.(e)) {
+      dropBall(e.clientX, e.clientY);
+    }
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (calibrating && calibration) calibration.handleMove(e.clientX, e.clientY);   // zoom loupe
+    if (drag) { drag.x1 = e.clientX; drag.y1 = e.clientY; }
+  });
+  canvas.addEventListener("pointerup", () => {
+    if (!drag) return;
+    if (Math.hypot(drag.x1 - drag.x0, drag.y1 - drag.y0) > 10) {
+      fakeNotes.push(makeFakeNote(drag.x0, drag.y0, drag.x1, drag.y1));
+      fakesDirty = true;
+    }
+    drag = null;
+  });
+  // right-click on a fake note deletes it
+  canvas.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const p = { x: e.clientX, y: e.clientY };
+    const hit = fakeNotes.findIndex((n) => Matter.Vertices.contains(n.corners, p));
+    if (hit >= 0) { fakeNotes.splice(hit, 1); fakesDirty = true; purge = true; }
+  });
+
+  addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key.toLowerCase();
+    if (calibrating && calibration) {            // Backspace = undo, Esc = cancel (A handles the details)
+      e.preventDefault();
+      if (e.key === "C") calibration.cancel();   // shift+c = cancel, same as Esc
+      else calibration.handleKey(e.key);
+      syncCalibrating();
+      return;
+    }
+    if (project.onKey?.(e)) { e.preventDefault(); return; }
+    if (k === " ") { e.preventDefault(); dropBall(canvas.width / 2 + (Math.random() - 0.5) * 300, 40); }
+    else if (k === "m") view.showMask = !view.showMask;
+    else if (k === "v") view.showFeed = !view.showFeed;
+    else if (k === "o") view.outlines = !view.outlines;
+    else if (k === "h") { view.panel = !view.panel; applyUI(); }
+    else if (k === "p") { view.projector = !view.projector; view.panel = !view.projector; applyUI(); }
+    else if (k === "n") { fakeNotes = []; fakesDirty = true; purge = true; }
+    else if (e.key === "C") { calibration?.clear(); flash = "calibration cleared"; }
+    else if (k === "c") {
+      if (!calibration) flash = "calibration.js failed to load";
+      else if (!detector.video) flash = "camera not running yet, can't calibrate";
+      else {
+        calibration.start(detector.video, detector.width, detector.height);
+        calibrating = true; flash = ""; applyUI();
+      }
+    }
+    else if (k === "x") clearBalls();
+    else if (k === "f") document.documentElement.requestFullscreen?.();
+  });
+
+  // ---------- boot ----------
+  function whenCvReady() {
+    return new Promise((resolve) => {
+      if (globalThis.cv && cv.Mat) return resolve();
+      cv["onRuntimeInitialized"] = resolve;
+    });
+  }
+
+  (async () => {
+    canvas.width = innerWidth; canvas.height = innerHeight;
+    maskCanvas.width = innerWidth; maskCanvas.height = innerHeight;
+    project.setup?.({ Matter, engine, world, canvas, ctx, view, dropBall, clearBalls });
+    rebuildWalls();
+    stat.textContent = "loading OpenCV…";
+    await whenCvReady();
+    readTuner();
+    stat.textContent = "starting camera… allow webcam";
+    try {
+      await detector.start();
+    } catch (err) {
+      // no camera: keep going so fake notes (shift+drag) still work
+      flash = "no camera: " + err.message;
+    }
+    requestAnimationFrame(frame);
+  })();
+}

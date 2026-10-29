@@ -1,8 +1,9 @@
-// Game mode: 5 levels. Each round, 10 balls drop from a fixed chute (space).
+// Cup game (game.html): 5 levels. Each round, 10 balls drop from a fixed chute (space).
 // Land them in the cup, past the level's walls, to score. Notes (real or fake)
 // are how you steer them. Get PASS_HITS balls in to unlock the next level.
 //
-// API: toggle(), active, layout(w, h), startLevel(i), release(now), reset(), update(now), draw(ctx, now)
+// Game API: layout(w, h), startLevel(i), release(now), reset(), update(now), draw(ctx, now).
+// The default export wires it into core/core.js as a project.
 // Colors: never pink or red, the camera would see them as notes.
 
 const { Bodies, Composite } = Matter;
@@ -64,7 +65,6 @@ export class Game {
   constructor({ world, dropBall }) {
     this.world = world;
     this.dropBall = dropBall;   // (x, y) -> ball body
-    this.active = false;
     this.w = 0; this.h = 0;
     this.level = 0;
     this.levelScores = LEVELS.map(() => null);   // this run's clearing score per level
@@ -82,12 +82,6 @@ export class Game {
   get passed() { return this.hits >= PASS_HITS; }
   get total() { return this.levelScores.reduce((a, s) => a + (s || 0), 0); }
 
-  toggle() {
-    this.active = !this.active;
-    if (this.active) { this.levelScores = LEVELS.map(() => null); this.startLevel(0); }
-    else { this.removeLive(); Composite.remove(this.world, this.bodies); this.bodies = []; }
-  }
-
   startLevel(i) {
     this.level = Math.max(0, Math.min(LEVELS.length - 1, i));
     this.build();
@@ -96,7 +90,7 @@ export class Game {
 
   layout(w, h) {
     this.w = w; this.h = h;
-    if (this.active) this.build();
+    this.build();
   }
 
   build() {
@@ -134,7 +128,6 @@ export class Game {
   }
 
   release(now) {
-    if (!this.active) return;
     if (this.state === "over") {
       if (now - this.overAt <= RESTART_GUARD_MS) return;
       if (!this.passed) this.reset();                                   // try again
@@ -164,7 +157,6 @@ export class Game {
   update(now) {
     const dt = Math.min(100, now - (this.lastT || now));
     this.lastT = now;
-    if (!this.active) return;
 
     const inWorld = new Set(Composite.allBodies(this.world));
     const c = this.cup;
@@ -191,7 +183,6 @@ export class Game {
   }
 
   draw(ctx, now) {
-    if (!this.active) return;
     ctx.save();
     this.drawLevel(ctx);
     this.drawChute(ctx, now);
@@ -321,3 +312,24 @@ export class Game {
     ctx.globalAlpha = 1;
   }
 }
+
+// ---------- project hooks (see core/core.js) ----------
+let game;
+export default {
+  title: "Cup Game",
+  help: `<b>space</b> drop ball (10 per round) · <b>r</b> replay level<br>
+         <b>1</b>–<b>${LEVELS.length}</b> jump to level · clicks don't drop balls`,
+  setup(core) { game = new Game(core); },
+  resize(w, h) { game.layout(w, h); },
+  update(now) { game.update(now); },
+  draw(ctx, now) { game.draw(ctx, now); },
+  onKey(e) {
+    const k = e.key.toLowerCase();
+    if (k === " ") game.release(performance.now());
+    else if (k === "r") game.reset();
+    else if (k >= "1" && k <= String(LEVELS.length)) game.startLevel(+k - 1);
+    else return false;
+    return true;
+  },
+  onPointer() { return true; },   // balls only come from the chute
+};

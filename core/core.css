@@ -1,0 +1,24 @@
+:root { color-scheme: dark; }
+html, body { margin: 0; height: 100%; background: #05070a; overflow: hidden; font-family: ui-monospace, monospace; }
+#c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+#mask { display: none; }
+#panel {
+  position: fixed; top: 10px; left: 10px; z-index: 10;
+  background: rgba(10,14,20,.82); border: 1px solid #1e2a38; border-radius: 10px;
+  padding: 12px 14px; color: #cfe; font-size: 12px; width: 250px;
+  backdrop-filter: blur(6px);
+}
+#panel h1 { font-size: 13px; margin: 0 0 8px; color: #fff; }
+#pages { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+#pages a { color: #8fb; text-decoration: none; border: 1px solid #2c3e52; border-radius: 6px; padding: 2px 7px; }
+#pages a:hover { background: #1b2735; }
+#pages a.here { color: #05070a; background: #8fb; border-color: #8fb; }
+.row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.row label { width: 46px; color: #8fb; }
+.row input[type=range] { flex: 1; }
+.row span { width: 30px; text-align: right; color: #fff; }
+#stat { margin: 8px 0; color: #ff7fbf; font-weight: bold; }
+.keys { margin-top: 10px; color: #7899; font-size: 11px; line-height: 1.6; }
+.keys b { color: #cfe; }
+button { background:#1b2735; color:#cfe; border:1px solid #2c3e52; border-radius:6px; padding:4px 8px; cursor:pointer; font:inherit; }
+button:hover { background:#2a3a4d; }
