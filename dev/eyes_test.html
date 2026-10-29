@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Eyes test (no webcam)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #05070a; overflow: hidden; font-family: ui-monospace, monospace; color: #cfe; }
+    #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+    #info { position: fixed; top: 10px; left: 10px; background: rgba(10,14,20,.85); border: 1px solid #1e2a38; border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.6; white-space: pre; }
+  </style>
+</head>
+<body>
+  <!--
+    Tests note_detector.js + calibration.js without a webcam or projector.
+
+    A fake "camera" canvas looks at the projector screen from an angle (a
+    perspective warp). Pink notes are painted on that camera image, including a
+    coral one that only the second hue range (hue2) catches, and a yellow ball
+    that must be ignored.
+
+    Keys: a = auto-calibrate (clicks the 4 known points), c = calibrate by hand,
+    m = show the detector mask, Shift+C = clear calibration.
+    White dashed = where the notes really are. Cyan = detected + calibrated.
+  -->
+  <canvas id="c"></canvas>
+  <div id="info">loading OpenCV…</div>
+
+  <script src="../opencv.js"></script>
+  <script type="module">
+    import { NoteDetector } from "../note_detector.js";
+    import { Calibration, solveHomography, applyHomography } from "../calibration.js";
+
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+    const info = document.getElementById("info");
+
+    // ---------- fake camera ----------
+    const CAM_W = 1280, CAM_H = 720;
+    const cam = document.createElement("canvas");
+    cam.width = CAM_W; cam.height = CAM_H;
+    const camCtx = cam.getContext("2d");
+
+    // Where the projector's dot targets appear in the camera image (tilted view).
+    const targets = [{ x: 0.08, y: 0.08 }, { x: 0.92, y: 0.08 }, { x: 0.92, y: 0.92 }, { x: 0.08, y: 0.92 }];
+    const camQuad = [{ x: 210, y: 95 }, { x: 1120, y: 140 }, { x: 1065, y: 655 }, { x: 160, y: 600 }];
+    const projToCam = solveHomography(targets, camQuad); // screen fraction -> camera px
+
+    // Notes in projector space (fractions of the screen) + their colour.
+    const notes = [
+      { x: 0.30, y: 0.40, w: 0.07, h: 0.10, rot: 0,   color: "#ff1493" }, // hot pink, range 1
+      { x: 0.55, y: 0.60, w: 0.08, h: 0.11, rot: 25,  color: "#ff3fa4" }, // pink, rotated
+      { x: 0.75, y: 0.30, w: 0.07, h: 0.09, rot: -10, color: "#ff6a4d" }, // coral, only hue2 catches it
+    ];
+    const noteCorners = (n) => {
+      const a = n.rot * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+      // aspect-correct rotation in a 16:9 screen
+      const hw = n.w / 2, hh = n.h / 2 * 16 / 9;
+      return [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([dx, dy]) => ({
+        x: n.x + (dx * ca - dy * sa), y: n.y + (dx * sa + dy * ca) * 9 / 16,
+      }));
+    };
+
+    function paintCamera(t) {
+      camCtx.fillStyle = "#2a2622"; // dim wall
+      camCtx.fillRect(0, 0, CAM_W, CAM_H);
+      camCtx.fillStyle = "#3b3833"; // the projected screen area, a bit brighter
+      poly(camCtx, camQuad); camCtx.fill();
+      for (const n of notes) {
+        camCtx.fillStyle = n.color;
+        poly(camCtx, noteCorners(n).map((p) => applyHomography(projToCam, p)));
+        camCtx.fill();
+      }
+      // projected yellow ball bouncing around: must NOT be detected
+      const b = applyHomography(projToCam, { x: 0.5 + 0.3 * Math.sin(t / 700), y: 0.3 });
+      camCtx.fillStyle = "#ffd23f";
+      camCtx.beginPath(); camCtx.arc(b.x, b.y, 28, 0, Math.PI * 2); camCtx.fill();
+      // calibration dots as the camera would see them
+      if (calibration.active) {
+        camCtx.strokeStyle = "#fff"; camCtx.lineWidth = 3;
+        for (const p of camQuad) { camCtx.beginPath(); camCtx.arc(p.x, p.y, 10, 0, Math.PI * 2); camCtx.stroke(); }
+      }
+    }
+
+    function poly(c, pts) {
+      c.beginPath(); c.moveTo(pts[0].x, pts[0].y);
+      for (const p of pts.slice(1)) c.lineTo(p.x, p.y);
+      c.closePath();
+    }
+
+    // ---------- detector + calibration ----------
+    const mask = document.createElement("canvas");
+    const detector = new NoteDetector({ source: cam, debugCanvas: mask });
+    const calibration = new Calibration({ storageKey: "dm01.calibration.test" });
+    let showMask = false;
+
+    function autoCalibrate() {
+      calibration.start(cam, CAM_W, CAM_H);
+      draw(); // lays out the camera image so clicks can be placed
+      const { x, y, s } = calibration.pip;
+      for (const p of camQuad) calibration.handleClick(x + p.x * s, y + p.y * s);
+    }
+
+    // Average distance between true note centers and detected+calibrated centers.
+    function measure(mapped) {
+      const W = canvas.width, H = canvas.height;
+      const errs = notes.map((n) => {
+        const t = { x: n.x * W, y: n.y * H };
+        let best = Infinity;
+        for (const m of mapped) best = Math.min(best, Math.hypot(m.center.x - t.x, m.center.y - t.y));
+        return best;
+      });
+      return errs;
+    }
+
+    function draw() {
+      const W = canvas.width = innerWidth, H = canvas.height = innerHeight;
+      paintCamera(performance.now());
+
+      info.style.display = calibration.active ? "none" : "";
+      if (calibration.active) { calibration.draw(ctx); return; }
+
+      ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+      if (showMask) {
+        ctx.globalAlpha = 0.5;
+        ctx.drawImage(mask, 0, 0, W, H);
+        ctx.globalAlpha = 1;
+      }
+
+      // ground truth
+      ctx.setLineDash([6, 6]); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1;
+      for (const n of notes) { poly(ctx, noteCorners(n).map((p) => ({ x: p.x * W, y: p.y * H }))); ctx.stroke(); }
+      ctx.setLineDash([]);
+
+      let line = "not calibrated: press a (auto) or c (by hand)";
+      if (calibration.isCalibrated) {
+        const mapped = calibration.mapNotes(detector.notes, W, H);
+        ctx.strokeStyle = "#3ff"; ctx.lineWidth = 3;
+        for (const m of mapped) { poly(ctx, m.corners); ctx.stroke(); }
+        const errs = measure(mapped);
+        window.testResult = { detected: detector.notes.length, expected: notes.length, errs };
+        line = `calibrated · center error px: ${errs.map((e) => e.toFixed(1)).join(", ")}`;
+      }
+      info.textContent =
+        `notes detected: ${detector.notes.length} / ${notes.length} (yellow ball must not count)\n` +
+        `detect: ${detector.detectMs.toFixed(1)} ms @ ${detector.procW}x${detector.procH}, frames ${detector.frameCount}\n` +
+        line + "\n" +
+        "a auto-calibrate · c calibrate by hand · m mask · Shift+C clear";
+    }
+
+    function loop() { draw(); requestAnimationFrame(loop); }
+
+    canvas.addEventListener("pointerdown", (e) => calibration.handleClick(e.clientX, e.clientY));
+    canvas.addEventListener("pointermove", (e) => calibration.handleMove(e.clientX, e.clientY));
+    addEventListener("keydown", (e) => {
+      if (calibration.handleKey(e.key)) { e.preventDefault(); return; }
+      if (e.key === "C") calibration.clear();
+      else if (e.key === "c") calibration.start(cam, CAM_W, CAM_H);
+      else if (e.key === "a") autoCalibrate();
+      else if (e.key === "m") showMask = !showMask;
+    });
+
+    function whenCvReady() {
+      return new Promise((resolve) => {
+        if (globalThis.cv && cv.Mat) return resolve();
+        cv["onRuntimeInitialized"] = resolve;
+      });
+    }
+
+    window.autoCalibrate = autoCalibrate;
+    window.detector = detector;
+    await whenCvReady();
+    paintCamera(0);
+    await detector.start();
+    loop();
+  </script>
+</body>
+</html>
