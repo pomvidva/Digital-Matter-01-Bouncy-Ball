@@ -67,14 +67,12 @@
 
     // ---------- calibration hooks (B6) ----------
     // calibration.js is Person A's. Loaded optionally so this page works without it.
-    // Expected API: start(), draw(ctx), handleClick(x, y), camToProj({x,y}), isCalibrated, clear()
+    // API: start(video, camW, camH), draw(ctx), handleClick/handleMove(x, y), handleKey(key),
+    //      active, camToProj(p, w, h), isCalibrated, clear()
     let calibration = null;
     let calibrating = false;
     import("./calibration.js")
-      .then((m) => {
-        const c = m.calibration ?? m.default ?? m;
-        if (typeof c.start === "function") calibration = c;
-      })
+      .then((m) => { calibration = new m.Calibration(); })
       .catch(() => { /* not written yet */ });
 
     // ---------- Matter.js world ----------
@@ -150,7 +148,7 @@
 
     // camera px -> screen px: calibrated homography if available, else fit + mirror
     function camToScreen(p) {
-      if (calibration?.isCalibrated) return calibration.camToProj(p);
+      if (calibration?.isCalibrated) return calibration.camToProj(p, canvas.width, canvas.height);
       return { x: mapX(p.x), y: mapY(p.y) };
     }
 
@@ -263,9 +261,8 @@
       const g = (id) => +document.getElementById(id).value;
       detector.lower = [g("hmin"), g("smin"), g("vmin")];
       detector.upper = [g("hmax"), g("smax"), g("vmax")];
-      // second hue range (pink that wraps past 179 into 0..). Used by the detector once A1 lands.
-      detector.lower2 = [g("h2min"), g("smin"), g("vmin")];
-      detector.upper2 = [g("h2max"), g("smax"), g("vmax")];
+      // second hue range (pink that wraps past 179 into 0..); shares S/V with the first
+      detector.hue2 = [g("h2min"), g("h2max")];
     }
     function saveTuner() {
       try {
@@ -400,17 +397,21 @@
     // ---------- input ----------
     // projector mode hides the panel and cursor; `h` can still toggle the panel after
     function applyUI() {
-      panel.style.display = view.panel ? "" : "none";
-      canvas.style.cursor = view.projector ? "none" : "";
+      // the panel would cover calibration dot 1, so it hides while calibrating
+      panel.style.display = view.panel && !calibrating ? "" : "none";
+      canvas.style.cursor = view.projector && !calibrating ? "none" : "";
     }
 
-    let calClicks = 0;   // calibration needs 4 clicks; B counts them only to know when to leave calibration mode
+    // calibration finishes itself after the 4th valid click, or on Esc
+    function syncCalibrating() {
+      if (calibrating && !calibration.active) { calibrating = false; applyUI(); }
+    }
 
     canvas.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
       if (calibrating && calibration) {            // clicks belong to calibration while it runs
         calibration.handleClick(e.clientX, e.clientY);
-        if (++calClicks >= 4) calibrating = false;
+        syncCalibrating();
       } else if (e.shiftKey) {                     // B1: start a fake note
         drag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY };
         canvas.setPointerCapture(e.pointerId);
@@ -419,6 +420,7 @@
       }
     });
     canvas.addEventListener("pointermove", (e) => {
+      if (calibrating && calibration) calibration.handleMove(e.clientX, e.clientY);   // zoom loupe
       if (drag) { drag.x1 = e.clientX; drag.y1 = e.clientY; }
     });
     canvas.addEventListener("pointerup", () => {
@@ -441,9 +443,9 @@
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const k = e.key.toLowerCase();
       if (calibrating && calibration) {            // Backspace = undo, Esc = cancel (A handles the details)
-        if (k === "escape") { calibrating = false; calClicks = 0; }
-        else if (k === "backspace") calClicks = Math.max(0, calClicks - 1);
-        calibration.handleKey?.(e);
+        e.preventDefault();
+        calibration.handleKey(e.key);
+        syncCalibrating();
         return;
       }
       if (k === " ") { e.preventDefault(); dropBall(canvas.width / 2 + (Math.random() - 0.5) * 300, 40); }
@@ -453,9 +455,14 @@
       else if (k === "h") { view.panel = !view.panel; applyUI(); }
       else if (k === "p") { view.projector = !view.projector; view.panel = !view.projector; applyUI(); }
       else if (k === "n") { fakeNotes = []; fakesDirty = true; purge = true; }
+      else if (e.key === "C") { calibration?.clear(); flash = "calibration cleared"; }
       else if (k === "c") {
-        if (!calibration) flash = "calibration.js not found yet (Person A)";
-        else { calibration.start(); calibrating = true; calClicks = 0; }
+        if (!calibration) flash = "calibration.js failed to load";
+        else if (!detector.video) flash = "camera not running yet, can't calibrate";
+        else {
+          calibration.start(detector.video, detector.width, detector.height);
+          calibrating = true; flash = ""; applyUI();
+        }
       }
       else if (k === "x") Composite.remove(world, Composite.allBodies(world).filter(b => b.label === "ball"));
       else if (k === "f") document.documentElement.requestFullscreen?.();
