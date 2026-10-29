@@ -101,8 +101,7 @@
         restitution: 0.8, friction: 0.02, frictionAir: 0.002, density: 0.001,
         render: {}, label: "ball",
       });
-      Body.setVelocity(ball, { x: (Math.random() - 0.5) * 6, y: 0 });
-      Composite.add(world, ball);
+      Composite.add(world, ball);   // no sideways push: it falls straight down
       // cap total balls
       const balls = Composite.allBodies(world).filter(b => b.label === "ball");
       if (balls.length > 40) Composite.remove(world, balls[0]);
