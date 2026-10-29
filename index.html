@@ -1,70 +1,234 @@
 <!doctype html>
-<html lang="th">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sheet detector</title>
-    <style>
-      body {
-        margin: 0;
-        font-family: Arial, sans-serif;
-        background: #111;
-        color: white;
-      }
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bouncy Ball — pink note physics (dev)</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #05070a; overflow: hidden; font-family: ui-monospace, monospace; }
+    #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+    #mask { display: none; }
+    #panel {
+      position: fixed; top: 10px; left: 10px; z-index: 10;
+      background: rgba(10,14,20,.82); border: 1px solid #1e2a38; border-radius: 10px;
+      padding: 12px 14px; color: #cfe; font-size: 12px; width: 250px;
+      backdrop-filter: blur(6px);
+    }
+    #panel h1 { font-size: 13px; margin: 0 0 8px; color: #fff; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    .row label { width: 42px; color: #8fb; }
+    .row input[type=range] { flex: 1; }
+    .row span { width: 30px; text-align: right; color: #fff; }
+    #stat { margin: 8px 0; color: #ff7fbf; font-weight: bold; }
+    .keys { margin-top: 10px; color: #7899; font-size: 11px; line-height: 1.6; }
+    .keys b { color: #cfe; }
+    button { background:#1b2735; color:#cfe; border:1px solid #2c3e52; border-radius:6px; padding:4px 8px; cursor:pointer; font:inherit; }
+    button:hover { background:#2a3a4d; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <canvas id="mask"></canvas>
 
-      #app {
-        max-width: 960px;
-        margin: 0 auto;
-        padding: 20px;
-      }
-
-      #status {
-        margin-bottom: 12px;
-      }
-
-      #camera-wrapper {
-        position: relative;
-        width: min(100%, 960px);
-        border-radius: 12px;
-        overflow: hidden;
-        border: 2px solid #333;
-        background: #000;
-      }
-
-      #camera-feed,
-      #overlay {
-        display: block;
-        width: 100%;
-        height: auto;
-        max-height: 75vh;
-        object-fit: cover;
-      }
-
-      #overlay {
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-      }
-    </style>
-  </head>
-  <body>
-    <div id="app">
-      <p id="status">กำลังโหลด OpenCV.js...</p>
-      <div id="camera-wrapper">
-        <video id="camera-feed" autoplay playsinline muted></video>
-        <canvas id="overlay"></canvas>
-      </div>
+  <div id="panel">
+    <h1>🎀 Pink note tuner</h1>
+    <div id="stat">notes: 0 · balls: 0</div>
+    <div class="row"><label>H min</label><input id="hmin" type="range" min="0" max="179" value="140"><span id="hminV">140</span></div>
+    <div class="row"><label>H max</label><input id="hmax" type="range" min="0" max="179" value="179"><span id="hmaxV">179</span></div>
+    <div class="row"><label>S min</label><input id="smin" type="range" min="0" max="255" value="70"><span id="sminV">70</span></div>
+    <div class="row"><label>S max</label><input id="smax" type="range" min="0" max="255" value="255"><span id="smaxV">255</span></div>
+    <div class="row"><label>V min</label><input id="vmin" type="range" min="0" max="255" value="70"><span id="vminV">70</span></div>
+    <div class="row"><label>V max</label><input id="vmax" type="range" min="0" max="255" value="255"><span id="vmaxV">255</span></div>
+    <div class="keys">
+      <b>click</b> drop ball · <b>space</b> drop at top<br>
+      <b>m</b> toggle mask view · <b>v</b> toggle feed<br>
+      <b>x</b> clear balls · <b>f</b> fullscreen
     </div>
+  </div>
 
-    <script>
-      // OpenCV.js เรียกฟังก์ชันนี้เมื่อ runtime พร้อมใช้งาน
-      var Module = {
-        onRuntimeInitialized() {
-          window.dispatchEvent(new Event("opencv-ready"));
-        }
-      };
-    </script>
-    <script async src="./opencv.js"></script>
-    <script type="module" src="./app.js"></script>
-  </body>
+  <script src="opencv.js"></script>
+  <script src="matter.min.js"></script>
+  <script type="module">
+    import { NoteDetector } from "./note_detector.js";
+
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+    const maskCanvas = document.getElementById("mask");
+    const stat = document.getElementById("stat");
+
+    const view = { showFeed: true, showMask: false, mirror: true };
+
+    // ---------- Matter.js world ----------
+    const { Engine, World, Bodies, Body, Composite } = Matter;
+    const engine = Engine.create();
+    engine.gravity.y = 1;
+    const world = engine.world;
+
+    let walls = [];
+    let noteBodies = [];
+
+    function rebuildWalls() {
+      Composite.remove(world, walls);
+      const w = canvas.width, h = canvas.height, t = 200;
+      walls = [
+        Bodies.rectangle(w / 2, -t / 2, w * 2, t, { isStatic: true }),          // top (open-ish, high up)
+        Bodies.rectangle(w / 2, h + t / 2, w * 2, t, { isStatic: true, restitution: 0.7 }), // floor
+        Bodies.rectangle(-t / 2, h / 2, t, h * 2, { isStatic: true, restitution: 0.7 }),     // left
+        Bodies.rectangle(w + t / 2, h / 2, t, h * 2, { isStatic: true, restitution: 0.7 }),  // right
+      ];
+      Composite.add(world, walls);
+    }
+
+    function dropBall(x, y) {
+      const ball = Bodies.circle(x, y, 20, {
+        restitution: 0.8, friction: 0.02, frictionAir: 0.002, density: 0.001,
+        render: {}, label: "ball",
+      });
+      Body.setVelocity(ball, { x: (Math.random() - 0.5) * 6, y: 0 });
+      Composite.add(world, ball);
+      // cap total balls
+      const balls = Composite.allBodies(world).filter(b => b.label === "ball");
+      if (balls.length > 40) Composite.remove(world, balls[0]);
+    }
+
+    // ---------- camera->canvas mapping (contain + optional mirror) ----------
+    let layout = { s: 1, ox: 0, oy: 0, camW: 1, camH: 1 };
+    function computeLayout(camW, camH) {
+      const s = Math.min(canvas.width / camW, canvas.height / camH);
+      layout = { s, ox: (canvas.width - camW * s) / 2, oy: (canvas.height - camH * s) / 2, camW, camH };
+    }
+    const mapX = (x) => view.mirror ? layout.ox + (layout.camW - x) * layout.s : layout.ox + x * layout.s;
+    const mapY = (y) => layout.oy + y * layout.s;
+
+    // Rebuild static bodies from detected notes each frame.
+    function syncNoteBodies(notes) {
+      Composite.remove(world, noteBodies);
+      noteBodies = notes.map((n) => Bodies.rectangle(
+        mapX(n.center.x), mapY(n.center.y),
+        Math.max(4, n.size.width * layout.s), Math.max(4, n.size.height * layout.s),
+        { isStatic: true, angle: (view.mirror ? -1 : 1) * n.angle * Math.PI / 180, restitution: 0.9, label: "note" }
+      ));
+      Composite.add(world, noteBodies);
+    }
+
+    // ---------- detector ----------
+    const detector = new NoteDetector({
+      camera: "user",
+      debugCanvas: maskCanvas,
+      lower: [140, 70, 70],
+      upper: [179, 255, 255],
+    });
+
+    // ---------- tuner wiring ----------
+    const ids = ["hmin","hmax","smin","smax","vmin","vmax"];
+    function readTuner() {
+      const g = (id) => +document.getElementById(id).value;
+      detector.lower = [g("hmin"), g("smin"), g("vmin")];
+      detector.upper = [g("hmax"), g("smax"), g("vmax")];
+    }
+    ids.forEach((id) => {
+      const el = document.getElementById(id);
+      const out = document.getElementById(id + "V");
+      el.addEventListener("input", () => { out.textContent = el.value; readTuner(); });
+    });
+
+    // ---------- draw loop ----------
+    function frame() {
+      if (canvas.width !== innerWidth || canvas.height !== innerHeight) {
+        canvas.width = innerWidth; canvas.height = innerHeight;
+        maskCanvas.width = innerWidth; maskCanvas.height = innerHeight;
+        rebuildWalls();
+      }
+      if (detector.width) computeLayout(detector.width, detector.height);
+      syncNoteBodies(detector.notes || []);
+
+      Engine.update(engine, 1000 / 60);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // background: camera feed or mask
+      if (view.showMask) {
+        ctx.save(); ctx.globalAlpha = 0.9;
+        drawContain(maskCanvas);
+        ctx.restore();
+      } else if (view.showFeed && detector.video && detector.video.readyState >= 2) {
+        ctx.save(); ctx.globalAlpha = 0.4;
+        drawContain(detector.video);
+        ctx.restore();
+      }
+
+      // note collision boxes
+      ctx.lineWidth = 3; ctx.strokeStyle = "#ff2d95";
+      for (const b of noteBodies) drawBody(b);
+
+      // balls
+      for (const b of Composite.allBodies(world)) {
+        if (b.label !== "ball") continue;
+        ctx.beginPath();
+        ctx.arc(b.position.x, b.position.y, b.circleRadius, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffd23f"; ctx.fill();
+        ctx.lineWidth = 3; ctx.strokeStyle = "#fff"; ctx.stroke();
+      }
+
+      const nBalls = Composite.allBodies(world).filter(b => b.label === "ball").length;
+      stat.textContent = `notes: ${detector.notes?.length ?? 0} · balls: ${nBalls}`;
+
+      requestAnimationFrame(frame);
+    }
+
+    function drawContain(src) {
+      ctx.save();
+      if (view.mirror) { ctx.translate(canvas.width, 0); ctx.scale(-1, 1); }
+      const dx = view.mirror ? canvas.width - layout.ox - layout.camW * layout.s : layout.ox;
+      ctx.drawImage(src, dx, layout.oy, layout.camW * layout.s, layout.camH * layout.s);
+      ctx.restore();
+    }
+
+    function drawBody(b) {
+      const v = b.vertices;
+      ctx.beginPath();
+      ctx.moveTo(v[0].x, v[0].y);
+      for (let i = 1; i < v.length; i++) ctx.lineTo(v[i].x, v[i].y);
+      ctx.closePath();
+      ctx.stroke();
+    }
+
+    // ---------- input ----------
+    canvas.addEventListener("pointerdown", (e) => dropBall(e.clientX, e.clientY));
+    addEventListener("keydown", (e) => {
+      const k = e.key.toLowerCase();
+      if (k === " ") { e.preventDefault(); dropBall(canvas.width / 2 + (Math.random() - 0.5) * 300, 40); }
+      else if (k === "m") view.showMask = !view.showMask;
+      else if (k === "v") view.showFeed = !view.showFeed;
+      else if (k === "x") Composite.remove(world, Composite.allBodies(world).filter(b => b.label === "ball"));
+      else if (k === "f") document.documentElement.requestFullscreen?.();
+    });
+
+    // ---------- boot ----------
+    function whenCvReady() {
+      return new Promise((resolve) => {
+        if (globalThis.cv && cv.Mat) return resolve();
+        cv["onRuntimeInitialized"] = resolve;
+      });
+    }
+
+    (async () => {
+      canvas.width = innerWidth; canvas.height = innerHeight;
+      maskCanvas.width = innerWidth; maskCanvas.height = innerHeight;
+      rebuildWalls();
+      stat.textContent = "loading OpenCV…";
+      await whenCvReady();
+      readTuner();
+      stat.textContent = "starting camera… allow webcam";
+      try {
+        await detector.start();
+      } catch (err) {
+        stat.textContent = "error: " + err.message;
+        return;
+      }
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
 </html>
