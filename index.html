@@ -47,7 +47,8 @@
       <b>shift+drag</b> fake note · <b>right-click</b> delete it · <b>n</b> clear fakes<br>
       <b>m</b> mask view · <b>v</b> feed · <b>o</b> outlines<br>
       <b>p</b> projector mode · <b>h</b> hide panel<br>
-      <b>c</b> calibrate · <b>x</b> clear balls · <b>f</b> fullscreen
+      <b>c</b> calibrate · <b>shift+c</b> cancel (or reset saved)<br>
+      <b>x</b> clear balls · <b>f</b> fullscreen
     </div>
   </div>
 
@@ -443,7 +444,8 @@
       const k = e.key.toLowerCase();
       if (calibrating && calibration) {            // Backspace = undo, Esc = cancel (A handles the details)
         e.preventDefault();
-        calibration.handleKey(e.key);
+        if (e.key === "C") calibration.cancel();   // shift+c = cancel, same as Esc
+        else calibration.handleKey(e.key);
         syncCalibrating();
         return;
       }
