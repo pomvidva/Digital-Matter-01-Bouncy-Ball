@@ -8,7 +8,8 @@
  *
  * Detection results live in `detector.notes` and are also passed to `onUpdate`.
  * Each note is in CAMERA pixels:
- *   { center: {x,y}, size: {width,height}, angle, area, corners: [{x,y} x4] }
+ *   { center: {x,y}, size: {width,height}, angle, area, corners: [{x,y} x4],
+ *     outline: [{x,y}, ...] }   // convex hull of the blob, dents filled in
  * Map them to the projector with Calibration (calibration.js).
  *
  * OpenCV.js must already be loaded and available as `globalThis.cv`.
@@ -17,11 +18,29 @@
  * Pink sits at the top of the hue circle and wraps past 179 back to 0, so there
  * are two hue windows: [lower, upper] and `hue2` (shares S/V with the first).
  */
+// Laptop cameras usually carry one of these words in their label.
+// ("HD WebCam" / "HD User Facing" are common names for laptop cameras too.)
+const BUILT_IN_CAMERA = /integrated|built-?in|facetime|internal|front|ir camera|hd webcam|user facing/i;
+// External webcams often just say "USB" in the name (e.g. "USB 2.0 Camera").
+const EXTERNAL_CAMERA = /usb/i;
+
 export class NoteDetector {
+  /** All video inputs. Labels are empty until camera permission was granted once. */
+  static async listCameras() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((d) => d.kind === "videoinput");
+  }
+
   constructor(options = {}) {
-    this.camera = options.camera ?? "user";
-    this.width = options.width ?? 1280;
-    this.height = options.height ?? 720;
+    // "auto" (default) = prefer an external USB webcam over the laptop's built-in one.
+    // Also accepts "user" / "environment" (facingMode) or a deviceId.
+    this.camera = options.camera ?? "auto";
+    this.reqWidth = options.width ?? 1280;
+    this.reqHeight = options.height ?? 720;
+    this.width = this.reqWidth;
+    this.height = this.reqHeight;
+    this.cameraId = "";    // deviceId of the camera actually opened
+    this.cameraLabel = ""; // its name, e.g. "Logitech C920"
     this.minArea = options.minArea ?? 1500; // in full camera pixels
     this.rectangularityThreshold = options.rectangularity ?? 0.5;
     this.maxAspectRatio = options.maxAspectRatio ?? 8;
@@ -98,15 +117,30 @@ export class NoteDetector {
     this.video.muted = true;
     this.video.playsInline = true;
 
-    const isFacingMode = this.camera === "user" || this.camera === "environment";
-    const videoConstraint = isFacingMode
-      ? { facingMode: this.camera, width: this.width, height: this.height }
-      : { deviceId: { exact: this.camera }, width: this.width, height: this.height };
+    const size = { width: this.reqWidth, height: this.reqHeight };
+    const open = (video) => navigator.mediaDevices.getUserMedia({ video, audio: false });
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      video: videoConstraint,
-      audio: false,
-    });
+    if (this.camera === "auto") {
+      // Open any camera first: device labels stay empty until permission is granted.
+      this.stream = await open(size);
+      const cams = await NoteDetector.listCameras();
+      const current = this.stream.getVideoTracks()[0]?.getSettings().deviceId;
+      const pick = cams.find((c) => EXTERNAL_CAMERA.test(c.label))
+        ?? cams.find((c) => !BUILT_IN_CAMERA.test(c.label))
+        ?? cams[0];
+      if (pick && pick.deviceId !== current) {
+        this.stream.getTracks().forEach((t) => t.stop());
+        this.stream = await open({ ...size, deviceId: { exact: pick.deviceId } });
+      }
+    } else if (this.camera === "user" || this.camera === "environment") {
+      this.stream = await open({ ...size, facingMode: this.camera });
+    } else {
+      this.stream = await open({ ...size, deviceId: { exact: this.camera } });
+    }
+
+    const track = this.stream.getVideoTracks()[0];
+    this.cameraId = track?.getSettings().deviceId ?? "";
+    this.cameraLabel = track?.label ?? "";
     this.video.srcObject = this.stream;
     await this.video.play();
 
@@ -115,6 +149,53 @@ export class NoteDetector {
     this.height = this.video.videoHeight;
     this.video.width = this.width;
     this.video.height = this.height;
+  }
+
+  /**
+   * Freeze (lock=true) or release the camera's auto exposure / white balance /
+   * focus, so note colors stop drifting when the projected image changes.
+   * Locks at the CURRENT values. Returns { locked: [...], unsupported: [...] }.
+   */
+  async lockCamera(lock, { exposureTime } = {}) {
+    const track = this.stream?.getVideoTracks()[0];
+    if (!track?.getCapabilities) return { locked: [], unsupported: ["exposure", "white balance", "focus"] };
+    const caps = track.getCapabilities();
+    const now = track.getSettings();
+    const controls = [
+      // [name, mode key, value key that holds the current setting]
+      ["exposure", "exposureMode", "exposureTime"],
+      ["white balance", "whiteBalanceMode", "colorTemperature"],
+      ["focus", "focusMode", "focusDistance"],
+    ];
+    const locked = [], unsupported = [];
+    for (const [name, modeKey, valueKey] of controls) {
+      const want = lock ? "manual" : "continuous";
+      if (!caps[modeKey]?.includes(want)) { unsupported.push(name); continue; }
+      const c = { [modeKey]: want };
+      // keep today's value, otherwise "manual" may jump to some default (often very dark)
+      let value = now[valueKey];
+      if (valueKey === "exposureTime" && exposureTime !== undefined) value = exposureTime;
+      if (lock && value !== undefined) c[valueKey] = value;
+      try {
+        await track.applyConstraints({ advanced: [c] });
+        locked.push(name);
+      } catch {
+        unsupported.push(name);
+      }
+    }
+    // range + value for an exposure slider (units are camera specific)
+    const range = caps.exposureTime;
+    const exposure = lock && locked.includes("exposure") && range
+      ? { min: range.min, max: range.max, step: range.step || 1,
+          value: track.getSettings().exposureTime ?? exposureTime ?? range.min }
+      : null;
+    return { locked, unsupported, exposure };
+  }
+
+  /** Manual exposure time (only after lockCamera(true) locked exposure). */
+  async setExposure(value) {
+    const track = this.stream?.getVideoTracks()[0];
+    await track?.applyConstraints({ advanced: [{ exposureMode: "manual", exposureTime: value }] });
   }
 
   // Allocate the per-frame buffers once instead of every frame.
@@ -214,17 +295,29 @@ export class NoteDetector {
 
           const center = { x: rect.center.x * k, y: rect.center.y * k };
           const size = { width: width * k, height: height * k };
-          // Seen at an angle a note is a quadrilateral, not a rectangle: use its
-          // real 4 corners when the outline is clean, the fitted rect otherwise.
-          const quad = this.#quadCorners(contour);
-          found.push({
-            center,
-            size,
-            angle: rect.angle,
-            area: area * k * k,
-            corners: quad ? quad.map((p) => ({ x: p.x * k, y: p.y * k }))
-                          : rectCorners(center, size, rect.angle),
-          });
+          // Convex hull: a curled corner or a shadow bites a notch out of the mask,
+          // the hull fills it back in. Its shape is also far steadier frame to frame.
+          const hull = new cv.Mat();
+          try {
+            cv.convexHull(contour, hull, false, true);
+            // Seen at an angle a note is a quadrilateral, not a rectangle: use its
+            // real 4 corners when the outline is clean, the fitted rect otherwise.
+            const quad = this.#quadCorners(hull);
+            const h = hull.data32S;
+            const outline = [];
+            for (let i = 0; i < hull.rows; i++) outline.push({ x: h[i * 2] * k, y: h[i * 2 + 1] * k });
+            found.push({
+              center,
+              size,
+              angle: rect.angle,
+              area: area * k * k,
+              corners: quad ? quad.map((p) => ({ x: p.x * k, y: p.y * k }))
+                            : rectCorners(center, size, rect.angle),
+              outline,
+            });
+          } finally {
+            hull.delete();
+          }
         } finally {
           contour.delete();
         }

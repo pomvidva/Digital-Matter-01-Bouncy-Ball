@@ -22,6 +22,7 @@
 //   onNoteHit(note, ball, speed)   a ball started touching a note body
 
 import { NoteDetector } from "./note_detector.js";
+import { NoteStabilizer } from "./note_stabilizer.js";
 import projects from "../projects.js";
 
 export function start({ project = {} } = {}) {
@@ -49,6 +50,8 @@ export function start({ project = {} } = {}) {
         <b>m</b> mask view · <b>v</b> feed · <b>o</b> outlines<br>
         <b>p</b> projector mode · <b>h</b> hide panel<br>
         <b>c</b> calibrate · <b>shift+c</b> cancel (or reset saved)<br>
+        <b>w</b> switch camera · <b>e</b> lock exposure<br>
+        <b>l</b> lock notes (walls stop changing)<br>
         <b>x</b> clear balls · <b>f</b> fullscreen
       </div>
     </div>
@@ -142,34 +145,30 @@ export function start({ project = {} } = {}) {
   const mapX = (x) => view.mirror ? layout.ox + (layout.camW - x) * layout.s : layout.ox + x * layout.s;
   const mapY = (y) => layout.oy + y * layout.s;
 
-  // ---------- note tracking (B2) ----------
-  // Keep one body per physical note and move it, instead of deleting and
-  // re-creating it every frame (which made balls resting on it jitter/fall).
-  const MATCH_DIST = 60;   // px: max distance to count as "the same note"
-  const MAX_MISSING = 5;   // detections a note may vanish before its body is removed
-  const MIN_NOTE = 12;     // px: minimum note thickness
-  let tracks = [];         // { body, missing }
-  let purge = false;       // true -> unmatched bodies are removed at once (a fake note was deleted)
-  let lastNotes = null;   // detector.notes is a new array per detection -> identity change = new detection
+  // ---------- note tracking ----------
+  // Detected notes go through NoteStabilizer: each wall keeps its exact shape
+  // until the note really moves, so a ball dropped from the same spot always
+  // takes the same path. A wall body is rebuilt only when its shape's version
+  // changes. Fake notes are exact already and skip the stabilizer.
+  const stabilizer = new NoteStabilizer();
+  const noteWalls = new Map(); // stabilizer track id -> { version, body }
+  let fakeBodies = [];
+  let rawNotes = [];           // this detection's notes, unfiltered (drawn thin with `o`)
+  let lastDetection = null;    // detector.notes is a new array per detection
+  let lastCal;                 // calibration.H the walls were made with
 
-  // Matter's Body.setVertices/scale break a static body's infinite mass, so we
-  // write the rectangle's geometry into the body ourselves.
-  function setRect(body, cx, cy, w, h, angle) {
-    const cos = Math.cos(angle), sin = Math.sin(angle);
-    const local = [[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]];
-    body.vertices.forEach((v, i) => {
-      v.x = cx + local[i][0] * cos - local[i][1] * sin;
-      v.y = cy + local[i][0] * sin + local[i][1] * cos;
+  // convex polygon (screen px) -> static Matter body with exactly that shape
+  function polyBody(poly) {
+    const vertices = Matter.Vertices.clockwiseSort(poly.map((p) => ({ x: p.x, y: p.y })));
+    return Body.create({
+      position: Matter.Vertices.centre(vertices), vertices,
+      isStatic: true, restitution: 0.9, label: "note",
     });
-    body.position.x = body.positionPrev.x = cx;
-    body.position.y = body.positionPrev.y = cy;
-    body.angle = body.anglePrev = angle;
-    body.axes = Matter.Axes.fromVertices(body.vertices);
-    Matter.Bounds.update(body.bounds, body.vertices, body.velocity);
   }
 
   // ---------- notes in screen px (the A -> B contract) ----------
-  // A note is { corners: [{x,y} x4], center: {x,y} } in screen/projector pixels.
+  // A note is { corners: [{x,y} x4], center: {x,y}, outline?: [{x,y}...] }
+  // in screen/projector pixels. `outline` is the convex shape when the detector has it.
 
   // camera px -> screen px: calibrated homography if available, else fit + mirror
   function camToScreen(p) {
@@ -187,18 +186,9 @@ export function start({ project = {} } = {}) {
       cam = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => (
         { x: n.center.x + x * cos - y * sin, y: n.center.y + x * sin + y * cos }));
     }
-    return { corners: cam.map(camToScreen), center: camToScreen(n.center) };
-  }
-
-  // contract note -> rectangle for the physics body (x, y, w, h, angle)
-  function noteGeom(n) {
-    const [a, b, c] = n.corners;
-    return [
-      n.center.x, n.center.y,
-      Math.max(MIN_NOTE, Math.hypot(b.x - a.x, b.y - a.y)),   // >= 12px so balls can't tunnel
-      Math.max(MIN_NOTE, Math.hypot(c.x - b.x, c.y - b.y)),
-      Math.atan2(b.y - a.y, b.x - a.x),
-    ];
+    const note = { corners: cam.map(camToScreen), center: camToScreen(n.center) };
+    if (n.outline) note.outline = n.outline.map(camToScreen);
+    return note;
   }
 
   // ---------- fake notes (B1): shift+drag a line, it becomes a note along that line ----------
@@ -218,62 +208,55 @@ export function start({ project = {} } = {}) {
     };
   }
 
-  // detector notes + fake notes, rebuilt only when something changed
-  let combined = [], combinedKey = null, fakesDirty = true;
-  function currentNotes() {
-    const key = detector.notes;
-    const calKey = !!calibration?.isCalibrated;
-    if (key !== combinedKey || fakesDirty || calKey !== currentNotes.calKey) {
-      combinedKey = key; fakesDirty = false; currentNotes.calKey = calKey;
-      combined = [...(detector.notes || []).map(toScreenNote), ...fakeNotes];
-    }
-    return combined;
-  }
+  let fakesDirty = true;
 
-  function syncNoteBodies(notes) {
-    if (notes === lastNotes) return;   // nothing new since last frame
-    lastNotes = notes;
+  // runs every frame; does work only on a new detection, a calibration change,
+  // or a fake-note edit
+  function syncNoteBodies() {
+    let changed = false;
+    const cal = calibration?.isCalibrated ? calibration.H : null;
+    if (cal !== lastCal) { stabilizer.clear(); lastCal = cal; lastDetection = null; }
 
-    // 1. all (track, note) pairs close enough, nearest first
-    const pairs = [];
-    tracks.forEach((t, ti) => notes.forEach((n, ni) => {
-      const d = Math.hypot(t.body.position.x - n.center.x, t.body.position.y - n.center.y);
-      if (d < MATCH_DIST) pairs.push({ ti, ni, d });
-    }));
-    pairs.sort((a, b) => a.d - b.d);
-
-    // 2. greedily assign; each track and each note used at most once
-    const usedT = new Set(), usedN = new Set();
-    for (const { ti, ni } of pairs) {
-      if (usedT.has(ti) || usedN.has(ni)) continue;
-      usedT.add(ti); usedN.add(ni);
-      setRect(tracks[ti].body, ...noteGeom(notes[ni]));
-      tracks[ti].missing = 0;
+    if (detector.notes !== lastDetection) {
+      lastDetection = detector.notes;
+      rawNotes = (detector.notes || []).map(toScreenNote);
+      const seen = new Set();
+      for (const n of stabilizer.update(rawNotes)) {
+        seen.add(n.id);
+        const wall = noteWalls.get(n.id);
+        if (wall?.version === n.version) continue;   // same shape: leave the body alone
+        if (wall) Composite.remove(world, wall.body);
+        const body = polyBody(n.poly);
+        Composite.add(world, body);
+        noteWalls.set(n.id, { version: n.version, body });
+        changed = true;
+      }
+      for (const [id, wall] of noteWalls) {
+        if (seen.has(id)) continue;
+        Composite.remove(world, wall.body);
+        noteWalls.delete(id);
+        changed = true;
+      }
     }
 
-    // 3. unmatched tracks -> count a miss; remove after MAX_MISSING
-    tracks = tracks.filter((t, ti) => {
-      if (usedT.has(ti)) return true;
-      if (purge || ++t.missing > MAX_MISSING) { Composite.remove(world, t.body); return false; }
-      return true;
-    });
-    purge = false;
+    if (fakesDirty) {
+      fakesDirty = false;
+      Composite.remove(world, fakeBodies);
+      fakeBodies = fakeNotes.map((n) => polyBody(n.corners));
+      Composite.add(world, fakeBodies);
+      changed = true;
+    }
 
-    // 4. unmatched notes -> new bodies
-    notes.forEach((n, ni) => {
-      if (usedN.has(ni)) return;
-      const g = noteGeom(n);
-      const body = Bodies.rectangle(g[0], g[1], g[2], g[3], { isStatic: true, restitution: 0.9, label: "note" });
-      setRect(body, ...g);
-      Composite.add(world, body);
-      tracks.push({ body, missing: 0 });
-    });
-    noteBodies = tracks.map((t) => t.body);
+    if (changed) noteBodies = [...[...noteWalls.values()].map((w) => w.body), ...fakeBodies];
   }
 
   // ---------- detector ----------
+  // "auto" picks an external webcam over the laptop's own; `w` cycles and remembers
+  const CAMERA_KEY = "bouncy.camera";
+  let savedCamera = "auto";
+  try { savedCamera = localStorage.getItem(CAMERA_KEY) || "auto"; } catch { /* storage blocked */ }
   const detector = new NoteDetector({
-    camera: "user",
+    camera: savedCamera,
     debugCanvas: maskCanvas,
     lower: [140, 70, 70],
     upper: [179, 255, 255],
@@ -343,7 +326,7 @@ export function start({ project = {} } = {}) {
       rebuildWalls();
     }
     if (detector.width) computeLayout(detector.width, detector.height);
-    syncNoteBodies(currentNotes());
+    syncNoteBodies();
 
     stepPhysics(performance.now());
     project.update?.(performance.now());
@@ -368,6 +351,12 @@ export function start({ project = {} } = {}) {
     // note collision boxes. Cyan, never pink: the camera would detect projected
     // pink as a note, and that fake note would never go away.
     if (view.outlines) {
+      // thin grey: what the camera sees this instant; thick cyan: the locked wall.
+      // Hidden in projector mode so the camera never sees it.
+      if (!view.projector) {
+        ctx.lineWidth = 1; ctx.strokeStyle = "#8a96a3";
+        for (const n of rawNotes) drawPoly(n.outline ?? n.corners);
+      }
       ctx.lineWidth = 3; ctx.strokeStyle = "#00e5ff";
       for (const b of noteBodies) drawBody(b);
     }
@@ -398,7 +387,8 @@ export function start({ project = {} } = {}) {
       perf.text = `draw ${perf.frames} fps · detect ${perf.detects} fps`;
       perf.frames = perf.detects = 0; perf.t0 = t;
     }
-    stat.textContent = `notes: ${noteBodies.length} · balls: ${nBalls} · ${perf.text}` + (flash ? `\n${flash}` : "");
+    const notesInfo = stabilizer.locked ? "🔒 notes locked" : `jitter ${stabilizer.jitter.toFixed(1)}px`;
+    stat.textContent = `notes: ${noteBodies.length} · ${notesInfo} · balls: ${nBalls} · ${perf.text}` + (flash ? `\n${flash}` : "");
 
     if (calibrating && calibration) calibration.draw(ctx);
 
@@ -413,8 +403,9 @@ export function start({ project = {} } = {}) {
     ctx.restore();
   }
 
-  function drawBody(b) {
-    const v = b.vertices;
+  function drawBody(b) { drawPoly(b.vertices); }
+
+  function drawPoly(v) {
     ctx.beginPath();
     ctx.moveTo(v[0].x, v[0].y);
     for (let i = 1; i < v.length; i++) ctx.lineTo(v[i].x, v[i].y);
@@ -464,7 +455,7 @@ export function start({ project = {} } = {}) {
     e.preventDefault();
     const p = { x: e.clientX, y: e.clientY };
     const hit = fakeNotes.findIndex((n) => Matter.Vertices.contains(n.corners, p));
-    if (hit >= 0) { fakeNotes.splice(hit, 1); fakesDirty = true; purge = true; }
+    if (hit >= 0) { fakeNotes.splice(hit, 1); fakesDirty = true; }
   });
 
   addEventListener("keydown", (e) => {
@@ -484,7 +475,11 @@ export function start({ project = {} } = {}) {
     else if (k === "o") view.outlines = !view.outlines;
     else if (k === "h") { view.panel = !view.panel; applyUI(); }
     else if (k === "p") { view.projector = !view.projector; view.panel = !view.projector; applyUI(); }
-    else if (k === "n") { fakeNotes = []; fakesDirty = true; purge = true; }
+    else if (k === "n") { fakeNotes = []; fakesDirty = true; }
+    else if (k === "l") {
+      stabilizer.locked = !stabilizer.locked;
+      flash = stabilizer.locked ? "notes locked: walls won't change (l to unlock)" : "notes follow the camera again";
+    }
     else if (e.key === "C") { calibration?.clear(); flash = "calibration cleared"; }
     else if (k === "c") {
       if (!calibration) flash = "calibration.js failed to load";
@@ -494,9 +489,73 @@ export function start({ project = {} } = {}) {
         calibrating = true; flash = ""; applyUI();
       }
     }
+    else if (k === "w") switchCamera();
+    else if (k === "e") toggleCameraLock();
     else if (k === "x") clearBalls();
     else if (k === "f") document.documentElement.requestFullscreen?.();
   });
+
+  // e: freeze the camera's auto exposure / white balance at the current look
+  // Locking often drops to a very short exposure, so an Exp slider appears while
+  // locked; the last value is remembered and reused on the next lock.
+  const EXPOSURE_KEY = "bouncy.exposure";
+  let cameraLocked = false;
+  let expRow = null;
+  function showExposureSlider(exp) {
+    expRow?.remove(); expRow = null;
+    if (!exp) return;
+    expRow = document.createElement("div");
+    expRow.className = "row";
+    expRow.innerHTML = `<label>Exp</label><input type="range" min="${exp.min}" max="${exp.max}" step="${exp.step}" value="${exp.value}"><span>${Math.round(exp.value)}</span>`;
+    const input = expRow.querySelector("input"), out = expRow.querySelector("span");
+    input.addEventListener("input", async () => {
+      out.textContent = Math.round(+input.value);
+      try {
+        await detector.setExposure(+input.value);
+        localStorage.setItem(EXPOSURE_KEY, input.value);
+      } catch (err) { flash = "exposure: " + err.message; }
+    });
+    stat.after(expRow);
+  }
+  async function toggleCameraLock() {
+    if (!detector.stream) { flash = "camera not running"; return; }
+    const want = !cameraLocked;
+    let saved;
+    try { saved = localStorage.getItem(EXPOSURE_KEY); } catch { /* storage blocked */ }
+    const { locked, unsupported, exposure } = await detector.lockCamera(want,
+      { exposureTime: saved ? +saved : undefined });
+    if (locked.length) cameraLocked = want;
+    showExposureSlider(cameraLocked ? exposure : null);
+    flash = locked.length
+      ? `${want ? "🔒 locked" : "🔓 auto"}: ${locked.join(", ")}` +
+        (unsupported.length ? ` · camera can't: ${unsupported.join(", ")}` : "")
+      : `this camera can't lock: ${unsupported.join(", ")}`;
+  }
+
+  // next video input; the choice is saved so every page opens the same camera
+  let switching = false;
+  async function switchCamera() {
+    if (switching) return;
+    switching = true;
+    try {
+      const cams = await NoteDetector.listCameras();
+      if (cams.length < 2) { flash = `only one camera found: ${detector.cameraLabel || "?"}`; return; }
+      const i = cams.findIndex((c) => c.deviceId === detector.cameraId);
+      const next = cams[(i + 1) % cams.length];
+      flash = "switching camera…";
+      detector.stop();
+      detector.camera = next.deviceId;
+      await detector.start();
+      cameraLocked = false;   // a fresh stream starts on auto again
+      showExposureSlider(null);
+      try { localStorage.setItem(CAMERA_KEY, next.deviceId); } catch { /* storage blocked */ }
+      flash = `camera: ${detector.cameraLabel} (press c to recalibrate)`;
+    } catch (err) {
+      flash = "camera switch failed: " + err.message;
+    } finally {
+      switching = false;
+    }
+  }
 
   // ---------- boot ----------
   function whenCvReady() {
@@ -516,7 +575,21 @@ export function start({ project = {} } = {}) {
     readTuner();
     stat.textContent = "starting camera… allow webcam";
     try {
-      await detector.start();
+      try {
+        await detector.start();
+      } catch (err) {
+        // the saved camera was unplugged: fall back to auto
+        if (detector.camera === "auto") throw err;
+        detector.stop();
+        detector.camera = "auto";
+        await detector.start();
+      }
+      flash = `camera: ${detector.cameraLabel}`;
+      // An Exp value was saved last time: lock the camera again once its auto
+      // white balance / focus have settled, so `e` isn't needed after every reload.
+      let savedExp = null;
+      try { savedExp = localStorage.getItem(EXPOSURE_KEY); } catch { /* storage blocked */ }
+      if (savedExp) setTimeout(() => { if (!cameraLocked) toggleCameraLock(); }, 3000);
     } catch (err) {
       // no camera: keep going so fake notes (shift+drag) still work
       flash = "no camera: " + err.message;

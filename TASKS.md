@@ -12,10 +12,12 @@ What **A** hands to **B**, in **screen/projector pixels**:
 
 ```js
 notes = [
-  { corners: [{x,y}, {x,y}, {x,y}, {x,y}], center: {x,y} },
+  { corners: [{x,y}, {x,y}, {x,y}, {x,y}], center: {x,y}, outline: [{x,y}, ...] },
   // ...
 ]
 ```
+
+`outline` is optional: the note's convex shape (curled corners and shadow bites filled in). When present, the wall is built from it instead of `corners`.
 
 As long as both of you stick to this shape, you can work at the same time without waiting on each other.
 
@@ -40,7 +42,7 @@ As long as both of you stick to this shape, you can work at the same time withou
 **Branch:** `world`
 
 - [ ] **B1. Fake notes.** Drag with the mouse to create test notes in the contract shape, so no camera is needed yet.
-- [ ] **B2. In-place bodies.** Match notes to existing bodies by nearest center (within about 60px) and move the existing body instead of deleting and re-creating it. Remove a body only after it's been missing for about 5 detections. (Careful: `Body.setVertices` on a static body breaks its infinite mass in Matter.js, so update the vertex x/y, axes and bounds yourself.)
+- [x] **B2. In-place bodies.** *Replaced by `core/note_stabilizer.js`: each wall is a polygon that keeps its exact shape until the note moves more than 8px (median of the last 4 detections), and survives ~1s of the note being hidden. Tests: `node --test dev/stabilizer.test.mjs`.* Original task: Match notes to existing bodies by nearest center (within about 60px) and move the existing body instead of deleting and re-creating it. Remove a body only after it's been missing for about 5 detections. (Careful: `Body.setVertices` on a static body breaks its infinite mass in Matter.js, so update the vertex x/y, axes and bounds yourself.)
 - [ ] **B3. Steady physics.** Fixed timestep: build up real elapsed time and step at 1/60s, at most 4 steps per frame. Notes at least 12px thick, ball speed capped, so balls don't tunnel through.
 - [ ] **B4. Projector mode.** `p` = black background, no camera feed, no panel, no cursor. `h` = toggle panel, `o` = toggle note outlines. **Outlines cyan, never pink**: the camera would detect projected pink as a note, and that fake note would never disappear.
 - [ ] **B5. Tuner.** Add sliders for the second hue range (H2 min/max) and save all slider values to `localStorage`.
@@ -70,7 +72,9 @@ As long as both of you stick to this shape, you can work at the same time withou
 
 - [ ] Chrome on the projector display → `f` fullscreen → `p` projector mode
 - [ ] Tape or clamp the webcam in place **before** calibrating; recalibrate (`c`) if it moves
+- [ ] Wait for the camera picture to settle, press `e` to lock exposure, adjust `Exp` (remembered for next time)
 - [ ] Tune the color sliders under the room's lighting (check with `m` mask view); dim the lights if possible
+- [ ] Notes placed → `l` to lock the walls; the `jitter` readout should stay well under 8px before that
 - [ ] Record video for the portfolio 🎥
 
 ---
