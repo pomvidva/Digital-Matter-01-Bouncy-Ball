@@ -5,8 +5,9 @@
  *   pink   normal wall
  *   green  launch pad: a ball that touches one is shot away from it at
  *          GREEN_LAUNCH speed or more, so it keeps bouncing like a trampoline
- *   blue   splitter: a ball that hits one breaks into SPLIT_PARTS smaller
- *          balls that fan out; those can split again until they get too small
+ *   blue   splitter: a ball goes through it and comes out the far side as
+ *          SPLIT_PARTS smaller balls in a fan (hit the top, out the bottom);
+ *          those can split again until they get too small
  *
  * All coordinates are screen px. A polygon is [{x,y}, ...].
  */
@@ -30,29 +31,54 @@ export const SPLIT_PARTS = 3;
 export const SPLIT_SCALE = 0.7;
 export const MIN_SPLIT_RADIUS = 12;
 export const SPLIT_SPREAD = 0.5;        // radians between neighbouring pieces (~29 deg)
-export const SPLIT_MIN_SPEED = 4;       // pieces leave the note at least this fast
+export const SPLIT_MIN_SPEED = 4;       // pieces leave the far side at least this fast
 export const SPLIT_COOLDOWN_MS = 250;   // a fresh piece can't split again this soon
 
 const rotate = (v, a) => ({ x: v.x * Math.cos(a) - v.y * Math.sin(a), y: v.x * Math.sin(a) + v.y * Math.cos(a) });
 
 /**
- * The pieces a ball breaks into when it hits a blue note.
- *   position, vel, radius: the ball    normal: outwardNormal of the note at the ball
- * Pieces sit side by side along the note's surface, just off it, and fly out in
- * a fan around the ball's own direction (pushed away from the note if needed).
+ * Where a ray from `p` along unit direction `d` last leaves the polygon: the
+ * far side, as a distance along the ray. null if the ray misses it.
  */
-export function splitBall({ position, vel, normal, radius }) {
+export function rayExit(poly, p, d) {
+  let far = null;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const ex = b.x - a.x, ey = b.y - a.y;
+    const den = d.x * ey - d.y * ex;
+    if (Math.abs(den) < 1e-9) continue;     // parallel
+    const ax = a.x - p.x, ay = a.y - p.y;
+    const t = (ax * ey - ay * ex) / den;    // along the ray
+    const u = (ax * d.y - ay * d.x) / den;  // along the edge, 0..1
+    if (t >= 0 && u >= 0 && u <= 1 && (far === null || t > far)) far = t;
+  }
+  return far;
+}
+
+/**
+ * The pieces a ball breaks into when it goes through a blue note.
+ *   position, vel, radius: the ball    poly: the note
+ * The ball keeps its direction: the pieces appear just past the note's far side
+ * on the ball's path (or below its middle if the path misses it), side by side,
+ * and fly on in a fan around that direction.
+ */
+export function splitBall({ position, vel, radius, poly }) {
   const r = radius * SPLIT_SCALE;
-  const away = vel.x * normal.x + vel.y * normal.y;
-  const v = away >= SPLIT_MIN_SPEED ? { ...vel }
-    : { x: vel.x + normal.x * (SPLIT_MIN_SPEED - away), y: vel.y + normal.y * (SPLIT_MIN_SPEED - away) };
-  const along = { x: -normal.y, y: normal.x };
+  const speed = Math.hypot(vel.x, vel.y);
+  const d = speed > 1 ? { x: vel.x / speed, y: vel.y / speed } : { x: 0, y: 1 };
+  const v = speed >= SPLIT_MIN_SPEED ? { ...vel } : { x: d.x * SPLIT_MIN_SPEED, y: d.y * SPLIT_MIN_SPEED };
+  let from = position, t = rayExit(poly, position, d);
+  if (t === null) {
+    from = poly.reduce((c, q) => ({ x: c.x + q.x / poly.length, y: c.y + q.y / poly.length }), { x: 0, y: 0 });
+    t = rayExit(poly, from, d) ?? 0;
+  }
+  const exit = { x: from.x + d.x * (t + r + 2), y: from.y + d.y * (t + r + 2) };
+  const across = { x: -d.y, y: d.x };
   const parts = [];
   for (let i = 0; i < SPLIT_PARTS; i++) {
-    const k = i - (SPLIT_PARTS - 1) / 2;   // -1, 0, 1: left, middle, right
+    const k = i - (SPLIT_PARTS - 1) / 2;   // -1, 0, 1: one side, middle, other side
     parts.push({
-      position: { x: position.x + along.x * k * 2.2 * r + normal.x * 2,
-                  y: position.y + along.y * k * 2.2 * r + normal.y * 2 },
+      position: { x: exit.x + across.x * k * 2.2 * r, y: exit.y + across.y * k * 2.2 * r },
       velocity: rotate(v, k * SPLIT_SPREAD),
     });
   }

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   RESTITUTION, outwardNormal, greenLaunch, GREEN_LAUNCH,
-  splitBall, SPLIT_PARTS, SPLIT_SCALE, MIN_SPLIT_RADIUS, SPLIT_MIN_SPEED,
+  splitBall, rayExit, SPLIT_PARTS, SPLIT_SCALE, MIN_SPLIT_RADIUS, SPLIT_MIN_SPEED,
 } from "../core/note_behaviors.js";
 
 const deg = (d) => (d * Math.PI) / 180;
@@ -48,26 +48,43 @@ test("green never slows a ball that is already leaving faster", () => {
   close(v.y, -(GREEN_LAUNCH + 5));
 });
 
-test("blue splits a ball into smaller pieces that fan out", () => {
-  const out = splitBall({ position: { x: 100, y: 100 }, vel: { x: 0, y: -8 }, normal: { x: 0, y: -1 }, radius: 20 });
+test("rayExit finds the far side of the note", () => {
+  const sq = square(0, 0, 100);
+  close(rayExit(sq, { x: 10, y: -70 }, { x: 0, y: 1 }), 120);   // enters at -50, leaves at +50
+  assert.equal(rayExit(sq, { x: 80, y: -70 }, { x: 0, y: 1 }), null);
+});
+
+test("a ball that hits the top of blue comes out the bottom, in a fan", () => {
+  const sq = square(0, 0, 100);
+  const out = splitBall({ position: { x: 10, y: -70 }, vel: { x: 0, y: 8 }, radius: 20, poly: sq });
   close(out.radius, 20 * SPLIT_SCALE);
   assert.equal(out.parts.length, SPLIT_PARTS);
-  const speeds = out.parts.map((p) => Math.hypot(p.velocity.x, p.velocity.y));
-  for (const sp of speeds) close(sp, 8);                    // same speed, new directions
+  for (const p of out.parts) {
+    assert.ok(p.position.y > 50 + out.radius, "below the note");
+    close(Math.hypot(p.velocity.x, p.velocity.y), 8);          // same speed, new directions
+    assert.ok(p.velocity.y > 0, "still going down");
+  }
+  close(out.parts[1].position.x, 10);                          // on the ball's own path
   const xs = out.parts.map((p) => p.velocity.x);
-  assert.ok(xs[0] < 0 && Math.abs(xs[1]) < 1e-9 && xs[2] > 0, "left, straight, right");
+  assert.ok(xs[0] * xs[2] < 0 && Math.abs(xs[1]) < 1e-9, "one each side, one straight");
 });
 
-test("split pieces don't overlap each other or start inside the note", () => {
-  const out = splitBall({ position: { x: 0, y: 0 }, vel: { x: 0, y: -5 }, normal: { x: 0, y: -1 }, radius: 20 });
+test("a ball hitting the side of blue comes out the other side", () => {
+  const sq = square(0, 0, 100);
+  const out = splitBall({ position: { x: -70, y: 0 }, vel: { x: 9, y: 0 }, radius: 20, poly: sq });
+  for (const p of out.parts) assert.ok(p.position.x > 50 + out.radius && p.velocity.x > 0);
+});
+
+test("split pieces don't overlap each other", () => {
+  const out = splitBall({ position: { x: 0, y: -70 }, vel: { x: 0, y: 5 }, radius: 20, poly: square(0, 0, 100) });
   const [a, b] = out.parts.map((p) => p.position);
-  assert.ok(Math.hypot(a.x - b.x, a.y - b.y) > 2 * out.radius, "neighbours apart");
-  for (const p of out.parts) assert.ok(p.position.y <= 0, "on the ball's side of the note");
+  assert.ok(Math.hypot(a.x - b.x, a.y - b.y) > 2 * out.radius);
 });
 
-test("a ball resting on blue still splits and its pieces leave", () => {
-  const out = splitBall({ position: { x: 0, y: 0 }, vel: { x: 0, y: 0 }, normal: { x: 0, y: -1 }, radius: 20 });
-  close(out.parts[1].velocity.y, -SPLIT_MIN_SPEED);
+test("a slow ball still gets through, downwards", () => {
+  const out = splitBall({ position: { x: 0, y: -55 }, vel: { x: 0, y: 0 }, radius: 20, poly: square(0, 0, 100) });
+  close(out.parts[1].velocity.y, SPLIT_MIN_SPEED);
+  assert.ok(out.parts[1].position.y > 50);
 });
 
 test("a 20px ball splits twice, then the pieces are too small", () => {

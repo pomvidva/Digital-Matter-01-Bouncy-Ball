@@ -25,7 +25,7 @@
 //                            (note.plugin.color = "pink" | "green" | "blue")
 //
 // Note colors (rules in note_behaviors.js): pink = wall, green = launch pad,
-// blue = splitter that breaks a ball into smaller ones.
+// blue = splitter: a ball goes through and comes out the far side as smaller ones.
 
 import { NoteDetector } from "./note_detector.js";
 import { NoteStabilizer } from "./note_stabilizer.js";
@@ -213,9 +213,10 @@ export function start({ project = {} } = {}) {
     ctx.restore();
   }
 
-  // Blue splitters: a ball that hits one shrinks and two more pieces fly off
-  // beside it (the original body stays, so projects keep tracking it). Pieces
-  // too small, or fresh from a split, just bounce.
+  // Blue splitters: a ball that enters one shrinks and comes out the far side,
+  // with two more pieces beside it (the original body stays, so projects keep
+  // tracking it). Blue is a sensor, so pieces too small, or fresh from a split,
+  // just pass through unchanged.
   const splitQueue = new Map();   // ball -> blue note, one entry per ball per step
   function runSplits() {
     if (!splitQueue.size) return;
@@ -223,8 +224,7 @@ export function start({ project = {} } = {}) {
     for (const [ball, note] of splitQueue) {
       if (ball.circleRadius < MIN_SPLIT_RADIUS || now < (ball.plugin.splitUntil ?? 0)) continue;
       const out = splitBall({
-        position: ball.position, vel: ball.velocity, radius: ball.circleRadius,
-        normal: outwardNormal(note.vertices, ball.position),
+        position: ball.position, vel: ball.velocity, radius: ball.circleRadius, poly: note.vertices,
       });
       rings.push({ x: ball.position.x, y: ball.position.y, t0: performance.now(), color: SWATCH.blue });
       const [middle, ...others] = out.parts;
@@ -268,6 +268,7 @@ export function start({ project = {} } = {}) {
     const body = Body.create({
       position: Matter.Vertices.centre(vertices), vertices,
       isStatic: true, label: "note",
+      isSensor: color === "blue",   // balls go into a splitter instead of bouncing off
       plugin: { color },
     });
     // after create: isStatic resets restitution to 0 (see note_behaviors.js)
