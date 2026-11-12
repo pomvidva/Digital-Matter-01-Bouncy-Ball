@@ -19,6 +19,8 @@
 //   onKey(e)                 return true = handled, core skips its own key action
 //   onPointer(e)             left click (not calibration, not shift+drag);
 //                            return true = handled, core won't drop a ball
+//   keepBallsOnFloor         true = the floor is solid (by default balls fall
+//                            through it and are removed off the bottom)
 //   onNoteHit(note, ball, speed)   a ball started touching a note body
 //                            (note.plugin.color = "pink" | "green" | "blue")
 //
@@ -115,7 +117,8 @@ export function start({ project = {} } = {}) {
     const w = canvas.width, h = canvas.height, t = 200;
     walls = [
       Bodies.rectangle(w / 2, -t / 2, w * 2, t, { isStatic: true }),          // top (open-ish, high up)
-      Bodies.rectangle(w / 2, h + t / 2, w * 2, t, { isStatic: true, restitution: 0.7 }), // floor
+      // floor: a sensor (balls fall through) unless the project needs to land on it
+      Bodies.rectangle(w / 2, h + t / 2, w * 2, t, { isStatic: true, restitution: 0.7, isSensor: !project.keepBallsOnFloor }),
       Bodies.rectangle(-t / 2, h / 2, t, h * 2, { isStatic: true, restitution: 0.7 }),     // left
       Bodies.rectangle(w + t / 2, h / 2, t, h * 2, { isStatic: true, restitution: 0.7 }),  // right
     ];
@@ -143,7 +146,9 @@ export function start({ project = {} } = {}) {
   const FADE_MS = 600;
   // remove faded balls; returns a ball's opacity for drawing
   function fadeBalls(now) {
-    const gone = Composite.allBodies(world).filter(b => b.plugin.fadeAt && now - b.plugin.fadeAt > FADE_MS);
+    const below = canvas.height + 100;   // fell through the floor, out of sight
+    const gone = Composite.allBodies(world).filter(b => b.label === "ball" &&
+      ((b.plugin.fadeAt && now - b.plugin.fadeAt > FADE_MS) || b.position.y > below));
     if (gone.length) Composite.remove(world, gone);
   }
   const ballAlpha = (b, now) => b.plugin.fadeAt ? Math.max(0, 1 - (now - b.plugin.fadeAt) / FADE_MS) : 1;

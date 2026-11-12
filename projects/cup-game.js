@@ -320,6 +320,7 @@ export class Game {
 let game;
 export default {
   title: "Cup Game",
+  keepBallsOnFloor: true,   // the floor is the cup's bottom: balls must land on it to score
   help: `<b>space</b> drop ball (10 per round) · <b>r</b> replay level<br>
          <b>1</b>–<b>${LEVELS.length}</b> jump to level · clicks don't drop balls`,
   setup(core) { game = new Game(core); },
