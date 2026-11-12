@@ -45,7 +45,9 @@ export class NoteDetector {
     this.height = this.reqHeight;
     this.cameraId = "";    // deviceId of the camera actually opened
     this.cameraLabel = ""; // its name, e.g. "Logitech C920"
-    this.minArea = options.minArea ?? 1500; // in full camera pixels
+    // in full camera pixels: 400 = a 20x20 blob, about one sticky note seen
+    // from across a room (1500 needed several notes stuck together)
+    this.minArea = options.minArea ?? 400;
     this.rectangularityThreshold = options.rectangularity ?? 0.5;
     this.maxAspectRatio = options.maxAspectRatio ?? 8;
 

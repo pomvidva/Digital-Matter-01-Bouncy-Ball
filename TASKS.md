@@ -83,7 +83,7 @@ As long as both of you stick to this shape, you can work at the same time withou
 
 - A: auto-calibration (project a white rectangle and detect its corners, no clicking)
 - B: ball trails, notes that glow when hit, a sound per note
-- Both: different note colors with different behaviors (bouncy, sticky, portal, goal)
+- Both: different note colors with different behaviors (bouncy, sticky, magnet, goal)
 - README with a GIF + how-it-works diagram for the bit.studio application
 - Move the old `app.js` + `sheet_detector.js` into `/old`
 

@@ -12,7 +12,7 @@
 //   help                     HTML for the panel's key list (replaces the sandbox's
 //                            "click drop ball · space drop at top" line)
 //   setup(core)              once, before the first frame. core = { Matter, engine,
-//                            world, canvas, ctx, view, dropBall(x, y), clearBalls() }
+//                            world, canvas, ctx, view, dropBall(x, y, radius?), clearBalls() }
 //   resize(w, h)             canvas size changed (also called once after setup)
 //   update(now)              every frame, after physics
 //   draw(ctx, now)           every frame, after notes and balls are drawn
@@ -23,13 +23,13 @@
 //                            (note.plugin.color = "pink" | "green" | "blue")
 //
 // Note colors (rules in note_behaviors.js): pink = wall, green = launch pad,
-// blue = portal to the other blue note (only with exactly 2 blue notes).
+// blue = splitter that breaks a ball into smaller ones.
 
 import { NoteDetector } from "./note_detector.js";
 import { NoteStabilizer } from "./note_stabilizer.js";
 import {
-  NOTE_COLORS, RESTITUTION, PORTAL_COOLDOWN_MS, portalsActive, portalExit,
-  outwardNormal, greenLaunch,
+  NOTE_COLORS, RESTITUTION, outwardNormal, greenLaunch,
+  splitBall, MIN_SPLIT_RADIUS, SPLIT_COOLDOWN_MS,
 } from "./note_behaviors.js";
 import projects from "../projects.js";
 
@@ -54,6 +54,7 @@ export function start({ project = {} } = {}) {
       <div class="row"><label>S max</label><input id="smax" type="range" min="0" max="255" value="255"><span id="smaxV">255</span></div>
       <div class="row"><label>V min</label><input id="vmin" type="range" min="0" max="255" value="70"><span id="vminV">70</span></div>
       <div class="row"><label>V max</label><input id="vmax" type="range" min="0" max="255" value="255"><span id="vmaxV">255</span></div>
+      <div class="row"><label>Min</label><input id="minsize" type="range" min="6" max="60" value="20"><span id="minsizeV">20</span></div>
       <div class="keys">
         ${project.help ?? "<b>click</b> drop ball · <b>space</b> drop at top"}<br>
         <b>shift+drag</b> fake note · <b>right-click</b> delete it · <b>n</b> clear fakes<br>
@@ -122,8 +123,8 @@ export function start({ project = {} } = {}) {
     project.resize?.(w, h);
   }
 
-  function dropBall(x, y) {
-    const ball = Bodies.circle(x, y, 20, {
+  function dropBall(x, y, radius = 20) {
+    const ball = Bodies.circle(x, y, radius, {
       restitution: 0.8, friction: 0.02, frictionAir: 0.002, density: 0.001,
       render: {}, label: "ball",
     });
@@ -138,7 +139,7 @@ export function start({ project = {} } = {}) {
     Composite.remove(world, Composite.allBodies(world).filter(b => b.label === "ball"));
   }
 
-  const MAX_BALLS = 40;
+  const MAX_BALLS = 80;   // blue splits one ball into up to 9
   const FADE_MS = 600;
   // remove faded balls; returns a ball's opacity for drawing
   function fadeBalls(now) {
@@ -168,66 +169,71 @@ export function start({ project = {} } = {}) {
     streamButton.blur();   // else space (drop ball) would press the button again
   });
 
-  // ball <-> note contacts: blue notes queue a warp, and projects hear about
+  // ball <-> note contacts: green notes queue a launch, blue a split, and projects hear about
   // every contact (sounds, glow, scoring...)
-  const portalQueue = [];   // { ball, from } waiting for the end of the physics step
   Matter.Events.on(engine, "collisionStart", (e) => {
     for (const { bodyA: a, bodyB: b } of e.pairs) {
       const note = a.label === "note" ? a : b.label === "note" ? b : null;
       const ball = a.label === "ball" ? a : b.label === "ball" ? b : null;
       if (!note || !ball) continue;
-      if (note.plugin.color === "blue") portalQueue.push({ ball, from: note });
       if (note.plugin.color === "green") launchQueue.push({ ball, pad: note });
+      if (note.plugin.color === "blue") splitQueue.set(ball, note);
       project.onNoteHit?.(note, ball, ball.speed);
     }
   });
 
-  // Shoot queued balls off their green note (after the step, like portals), and
+  // Shoot queued balls off their green note (after the step, never inside the
+  // collision event: changing a body mid-solve confuses Matter), and
   // leave a ring where it happened so the launch is easy to see.
   const launchQueue = [];   // { ball, pad }
-  const LAUNCH_RING_MS = 450;
-  let launchRings = [];     // { x, y, t0 }
+  const RING_MS = 450;
+  let rings = [];           // { x, y, t0, color }: launch / split flashes
   function runLaunches() {
     for (const { ball, pad } of launchQueue.splice(0)) {
       const normal = outwardNormal(pad.vertices, ball.position);
       Body.setVelocity(ball, greenLaunch({ vel: ball.velocity, normal }));
-      launchRings.push({ x: ball.position.x, y: ball.position.y, t0: performance.now() });
+      rings.push({ x: ball.position.x, y: ball.position.y, t0: performance.now(), color: SWATCH.green });
     }
   }
-  function drawLaunchRings(now) {
-    launchRings = launchRings.filter((r) => now - r.t0 < LAUNCH_RING_MS);
+  function drawRings(now) {
+    rings = rings.filter((r) => now - r.t0 < RING_MS);
     ctx.save(); ctx.lineWidth = 3;
-    for (const r of launchRings) {
-      const k = (now - r.t0) / LAUNCH_RING_MS;
-      // white in projector mode: projected green would be detected as a note
-      ctx.strokeStyle = view.projector ? "#fff" : SWATCH.green;
+    for (const r of rings) {
+      const k = (now - r.t0) / RING_MS;
+      // white in projector mode: projected green/blue would be detected as a note
+      ctx.strokeStyle = view.projector ? "#fff" : r.color;
       ctx.globalAlpha = 1 - k;
       ctx.beginPath(); ctx.arc(r.x, r.y, 20 + 40 * k, 0, Math.PI * 2); ctx.stroke();
     }
     ctx.restore();
   }
 
-  const blueNotes = () => noteBodies.filter((b) => b.plugin.color === "blue");
-
-  // Move queued balls to the other blue note. Runs between engine steps, never
-  // inside the collision event (moving a body mid-solve confuses Matter).
-  function runPortals() {
-    if (!portalQueue.length) return;
-    const blues = blueNotes();
+  // Blue splitters: a ball that hits one shrinks and two more pieces fly off
+  // beside it (the original body stays, so projects keep tracking it). Pieces
+  // too small, or fresh from a split, just bounce.
+  const splitQueue = new Map();   // ball -> blue note, one entry per ball per step
+  function runSplits() {
+    if (!splitQueue.size) return;
     const now = engine.timing.timestamp;
-    for (const { ball, from } of portalQueue.splice(0)) {
-      if (!portalsActive(blues.length) || !blues.includes(from)) continue;
-      if (now < (ball.portalUntil ?? 0)) continue;   // just came out of a portal
-      const to = blues.find((b) => b !== from);
-      const out = portalExit({
-        from: { center: from.position, poly: from.vertices },
-        to: { center: to.position, poly: to.vertices },
-        vel: ball.velocity, radius: ball.circleRadius,
+    for (const [ball, note] of splitQueue) {
+      if (ball.circleRadius < MIN_SPLIT_RADIUS || now < (ball.plugin.splitUntil ?? 0)) continue;
+      const out = splitBall({
+        position: ball.position, vel: ball.velocity, radius: ball.circleRadius,
+        normal: outwardNormal(note.vertices, ball.position),
       });
-      Body.setPosition(ball, out.position);
-      Body.setVelocity(ball, out.velocity);
-      ball.portalUntil = now + PORTAL_COOLDOWN_MS;
+      rings.push({ x: ball.position.x, y: ball.position.y, t0: performance.now(), color: SWATCH.blue });
+      const [middle, ...others] = out.parts;
+      Body.scale(ball, out.radius / ball.circleRadius, out.radius / ball.circleRadius);
+      Body.setPosition(ball, middle.position);
+      Body.setVelocity(ball, middle.velocity);
+      ball.plugin.splitUntil = now + SPLIT_COOLDOWN_MS;
+      for (const part of others) {
+        const piece = dropBall(part.position.x, part.position.y, out.radius);
+        Body.setVelocity(piece, part.velocity);
+        piece.plugin.splitUntil = now + SPLIT_COOLDOWN_MS;
+      }
     }
+    splitQueue.clear();
   }
 
   // ---------- camera->canvas mapping (contain + optional mirror) ----------
@@ -252,13 +258,11 @@ export function start({ project = {} } = {}) {
   let lastCal;                 // calibration.H the walls were made with
 
   // convex polygon (screen px) -> static Matter body with exactly that shape.
-  // Blue is a sensor: balls pass into it (and get warped) instead of bouncing.
   function polyBody(poly, color = "pink") {
     const vertices = Matter.Vertices.clockwiseSort(poly.map((p) => ({ x: p.x, y: p.y })));
     const body = Body.create({
       position: Matter.Vertices.centre(vertices), vertices,
       isStatic: true, label: "note",
-      isSensor: color === "blue",
       plugin: { color },
     });
     // after create: isStatic resets restitution to 0 (see note_behaviors.js)
@@ -438,6 +442,22 @@ export function start({ project = {} } = {}) {
   loadTuner();
   showTuner();
 
+  // Min slider: smallest note kept, as the side of a square in camera px (all
+  // colors). Lower it if single notes are missed; raise it if specks show up.
+  const MIN_SIZE_KEY = "bouncy.minsize";
+  const minSize = document.getElementById("minsize");
+  const minSizeOut = document.getElementById("minsizeV");
+  function readMinSize() {
+    minSizeOut.textContent = minSize.value;
+    detector.minArea = minSize.value ** 2;
+  }
+  try { const v = localStorage.getItem(MIN_SIZE_KEY); if (v) minSize.value = v; } catch { /* storage blocked */ }
+  readMinSize();
+  minSize.addEventListener("input", () => {
+    readMinSize();
+    try { localStorage.setItem(MIN_SIZE_KEY, minSize.value); } catch { /* storage blocked */ }
+  });
+
   // ---------- fixed-timestep physics ----------
   // Step by real elapsed time so speed doesn't depend on display refresh rate or
   // on frames lost to OpenCV; small steps keep fast balls from tunnelling.
@@ -449,8 +469,8 @@ export function start({ project = {} } = {}) {
     const balls = Composite.allBodies(world).filter(b => b.label === "ball");
     while (acc >= STEP_MS) {
       Engine.update(engine, STEP_MS);
-      runPortals();
       runLaunches();
+      runSplits();
       for (const b of balls) {
         const sp = Math.hypot(b.velocity.x, b.velocity.y);
         if (sp > MAX_SPEED) Body.setVelocity(b, { x: b.velocity.x * MAX_SPEED / sp, y: b.velocity.y * MAX_SPEED / sp });
@@ -496,7 +516,7 @@ export function start({ project = {} } = {}) {
 
     // note collision boxes, in the note's color on the screen but plain white in
     // projector mode: projected pink/green/cyan would be detected as a note by
-    // the camera, and that fake note would never go away. Portals are dashed.
+    // the camera, and that fake note would never go away. Splitters are dashed.
     if (view.outlines) {
       // thin grey: what the camera sees this instant; thick: the locked wall.
       // Hidden in projector mode so the camera never sees it.
@@ -531,7 +551,7 @@ export function start({ project = {} } = {}) {
       ctx.fillStyle = "#fff"; ctx.fill();
     }
     ctx.globalAlpha = 1;
-    drawLaunchRings(tBalls);
+    drawRings(tBalls);
 
     if (project.draw) { ctx.save(); project.draw(ctx, performance.now()); ctx.restore(); }
 
@@ -545,10 +565,7 @@ export function start({ project = {} } = {}) {
       perf.frames = perf.detects = 0; perf.t0 = t;
     }
     const notesInfo = stabilizer.locked ? "🔒 notes locked" : `jitter ${stabilizer.jitter.toFixed(1)}px`;
-    const nBlue = blueNotes().length;
-    const portalInfo = nBlue === 0 ? ""
-      : portalsActive(nBlue) ? " · 🌀 portal on" : ` · ⚠ portal off: ${nBlue} blue (need 2)`;
-    stat.textContent = `notes: ${noteBodies.length} · ${notesInfo} · balls: ${nBalls} · ${perf.text}${portalInfo}` +
+    stat.textContent = `notes: ${noteBodies.length} · ${notesInfo} · balls: ${nBalls} · ${perf.text}` +
       (flash ? `\n${flash}` : "");
 
     if (calibrating && calibration) calibration.draw(ctx);
