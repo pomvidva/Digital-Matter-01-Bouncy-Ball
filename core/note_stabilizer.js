@@ -41,9 +41,10 @@ export class NoteStabilizer {
     this.jitter = 0;     // largest change (px) seen this update that did NOT move a wall
   }
 
-  /** Notes that currently have a locked shape: [{ id, version, center, poly }]. */
+  /** Notes that currently have a locked shape: [{ id, version, center, poly, color }]. */
   get stable() {
-    return this.tracks.filter((t) => t.poly).map(({ id, version, center, poly }) => ({ id, version, center, poly }));
+    return this.tracks.filter((t) => t.poly)
+      .map(({ id, version, center, poly, color }) => ({ id, version, center, poly, color }));
   }
 
   /** Forget everything (e.g. calibration changed, so screen positions moved). */
@@ -58,14 +59,17 @@ export class NoteStabilizer {
 
     const obs = notes.map((n) => {
       const poly = convexHull(n.outline ?? n.corners);
-      return { poly, center: polygonCentroid(poly) };
+      return { poly, center: polygonCentroid(poly), color: n.color };
     }).filter((o) => o.poly.length >= 3);
 
-    // 1. pair tracks with observations, nearest first, each used once
+    // 1. pair tracks with observations, nearest first, each used once.
+    // Only the same color matches, so a note whose color flickers for a frame
+    // starts a new (unconfirmed) track instead of repainting the wall.
     const pairs = [];
     this.tracks.forEach((t, ti) => {
       const c = t.center ?? t.history[t.history.length - 1].center;
       obs.forEach((o, oi) => {
+        if (o.color !== t.color) return;
         const d = Math.hypot(c.x - o.center.x, c.y - o.center.y);
         if (d < this.matchDist) pairs.push({ ti, oi, d });
       });
@@ -84,7 +88,7 @@ export class NoteStabilizer {
     // 3. new notes
     obs.forEach((o, oi) => {
       if (usedO.has(oi)) return;
-      const t = { id: this.nextId++, version: 0, center: null, sig: null, poly: null, history: [], missing: 0, settle: 0 };
+      const t = { id: this.nextId++, version: 0, color: o.color, center: null, sig: null, poly: null, history: [], missing: 0, settle: 0 };
       this.tracks.push(t);
       this.#observe(t, o);
     });

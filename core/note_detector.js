@@ -6,17 +6,21 @@
  * wall: the projected ball is a different colour, so it is ignored.
  * (So never project pink yourself — the camera would see it as a note.)
  *
+ * Several note colors are found in one pass (`detector.colors`, see
+ * defaultColors()); each note says which one it is.
+ *
  * Detection results live in `detector.notes` and are also passed to `onUpdate`.
  * Each note is in CAMERA pixels:
- *   { center: {x,y}, size: {width,height}, angle, area, corners: [{x,y} x4],
+ *   { color: "pink" | "green" | "blue", center: {x,y}, size: {width,height},
+ *     angle, area, corners: [{x,y} x4],
  *     outline: [{x,y}, ...] }   // convex hull of the blob, dents filled in
  * Map them to the projector with Calibration (calibration.js).
  *
  * OpenCV.js must already be loaded and available as `globalThis.cv`.
  *
  * HSV ranges use OpenCV conventions: H 0-179, S 0-255, V 0-255.
- * Pink sits at the top of the hue circle and wraps past 179 back to 0, so there
- * are two hue windows: [lower, upper] and `hue2` (shares S/V with the first).
+ * Pink sits at the top of the hue circle and wraps past 179 back to 0, so a
+ * color can have two hue windows: [lower, upper] and `hue2` (shares S/V).
  */
 // Laptop cameras usually carry one of these words in their label.
 // ("HD WebCam" / "HD User Facing" are common names for laptop cameras too.)
@@ -51,11 +55,17 @@ export class NoteDetector {
     this.procWidth = options.procWidth ?? 640;
     this.detectFps = options.detectFps ?? 20;
 
-    // Pink HSV window. Mutable at runtime (the tuner writes straight to these).
-    this.lower = options.lower ?? [140, 70, 70];
-    this.upper = options.upper ?? [179, 255, 255];
-    // Second hue window for red-leaning pink, [hMin, hMax]. null disables it.
-    this.hue2 = options.hue2 === undefined ? [0, 10] : options.hue2;
+    // One HSV window per note color: { lower, upper, hue2 }. Mutable at runtime
+    // (the tuner writes straight to these). `hue2` is a second hue window
+    // [hMin, hMax] sharing S/V, for hues that wrap past 179 (pink); null = off.
+    // Each note comes back with `color` set to the key it matched.
+    this.colors = options.colors ?? defaultColors();
+    // old single-color options still set pink
+    if (options.lower) this.colors.pink.lower = options.lower;
+    if (options.upper) this.colors.pink.upper = options.upper;
+    if (options.hue2 !== undefined) this.colors.pink.hue2 = options.hue2;
+    // Which color the debug mask shows; null = all of them.
+    this.debugColor = options.debugColor ?? null;
 
     this.onUpdate = options.onUpdate ?? null;
     // Optional <canvas>; if set, the binary mask is drawn to it each frame
@@ -76,6 +86,14 @@ export class NoteDetector {
     this.mats = null;      // reused OpenCV buffers, see #ensureMats
     this.boundsKey = "";   // thresholds the bound Mats were built for
   }
+
+  // Pink's window under the old single-color names.
+  get lower() { return this.colors.pink.lower; }
+  set lower(v) { this.colors.pink.lower = v; }
+  get upper() { return this.colors.pink.upper; }
+  set upper(v) { this.colors.pink.upper = v; }
+  get hue2() { return this.colors.pink.hue2; }
+  set hue2(v) { this.colors.pink.hue2 = v; }
 
   async start() {
     if (this.running) return;
@@ -207,39 +225,50 @@ export class NoteDetector {
         frame: new cv.Mat(this.procH, this.procW, cv.CV_8UC4),
         rgb: new cv.Mat(),
         hsv: new cv.Mat(),
-        mask: new cv.Mat(),
-        mask2: new cv.Mat(),
+        mask: new cv.Mat(),   // all colors OR'd, cleaned up: where the notes are
+        mask2: new cv.Mat(),  // scratch: a color's hue2 window
+        blob: new cv.Mat(),   // scratch: one contour filled, for counting its colors
+        hit: new cv.Mat(),    // scratch: blob AND one color
+        none: new cv.Mat(),   // empty hierarchy for drawContours
         // Same physical kernel size as the old full-res 5px / 15px kernels.
         openKernel: cv.getStructuringElement(cv.MORPH_RECT,
           new cv.Size(odd(5 * this.scale), odd(5 * this.scale))),
         closeKernel: cv.getStructuringElement(cv.MORPH_RECT,
           new cv.Size(odd(15 * this.scale), odd(15 * this.scale))),
-        low: null, high: null, low2: null, high2: null,
+        bounds: {},   // color -> { low, high, low2, high2 }
+        colorMasks: {}, // color -> raw (uncleaned) mask of just that color
       };
     }
 
     // cv.inRange needs full-size bound mats in OpenCV.js (no scalar overload),
     // so rebuild them only when the tuner changes a threshold.
-    const key = JSON.stringify([this.lower, this.upper, this.hue2]);
+    const key = JSON.stringify(this.colors);
     if (key === this.boundsKey) return;
     this.boundsKey = key;
 
     const m = this.mats;
-    for (const name of ["low", "high", "low2", "high2"]) {
-      m[name]?.delete();
-      m[name] = null;
-    }
+    this.#deleteBounds();
     const bound = (h, s, v) =>
       new cv.Mat(this.procH, this.procW, cv.CV_8UC3, [h, s, v, 0]);
-    m.low = bound(this.lower[0], this.lower[1], this.lower[2]);
-    m.high = bound(this.upper[0], this.upper[1], this.upper[2]);
-    if (this.hue2) {
-      m.low2 = bound(this.hue2[0], this.lower[1], this.lower[2]);
-      m.high2 = bound(this.hue2[1], this.upper[1], this.upper[2]);
+    for (const [name, { lower, upper, hue2 }] of Object.entries(this.colors)) {
+      const b = { low: bound(...lower), high: bound(...upper), low2: null, high2: null };
+      if (hue2) {
+        b.low2 = bound(hue2[0], lower[1], lower[2]);
+        b.high2 = bound(hue2[1], upper[1], upper[2]);
+      }
+      m.bounds[name] = b;
     }
   }
 
-  #makeMask() {
+  #deleteBounds() {
+    const bounds = this.mats?.bounds ?? {};
+    for (const b of Object.values(bounds)) for (const mat of Object.values(b)) mat?.delete();
+    for (const mat of Object.values(this.mats?.colorMasks ?? {})) mat.delete();
+    if (this.mats) { this.mats.bounds = {}; this.mats.colorMasks = {}; }
+  }
+
+  // Grab + blur + HSV once per detection; every color's mask is cut from this.
+  #toHsv() {
     const cv = globalThis.cv;
     const m = this.mats;
 
@@ -250,18 +279,68 @@ export class NoteDetector {
     cv.cvtColor(m.frame, m.rgb, cv.COLOR_RGBA2RGB);
     cv.GaussianBlur(m.rgb, m.rgb, new cv.Size(5, 5), 0);
     cv.cvtColor(m.rgb, m.hsv, cv.COLOR_RGB2HSV);
-    cv.inRange(m.hsv, m.low, m.high, m.mask);
-    if (m.low2) {
-      cv.inRange(m.hsv, m.low2, m.high2, m.mask2);
-      cv.bitwise_or(m.mask, m.mask2, m.mask);
-    }
-    cv.morphologyEx(m.mask, m.mask, cv.MORPH_OPEN, m.openKernel, new cv.Point(-1, -1), 1);
-    cv.morphologyEx(m.mask, m.mask, cv.MORPH_CLOSE, m.closeKernel, new cv.Point(-1, -1), 2);
-    if (this.debugCanvas) cv.imshow(this.debugCanvas, m.mask);
-    return m.mask;
   }
 
-  #findNotes(mask) {
+  // Raw mask of one color (no cleanup) into m.colorMasks[name].
+  #colorMask(name, b) {
+    const cv = globalThis.cv;
+    const m = this.mats;
+    const out = (m.colorMasks[name] ??= new cv.Mat());
+    cv.inRange(m.hsv, b.low, b.high, out);
+    if (b.low2) {
+      cv.inRange(m.hsv, b.low2, b.high2, m.mask2);
+      cv.bitwise_or(out, m.mask2, out);
+    }
+    return out;
+  }
+
+  // Find blobs once on all colors together, then give each blob the color most
+  // of its pixels have. Cleaning up (open/close) is by far the slowest step, so
+  // doing it once instead of once per color keeps several colors as cheap as one.
+  // Catch: two notes of different colors that touch become one blob, one color.
+  #detect() {
+    const cv = globalThis.cv;
+    const m = this.mats;
+    this.#toHsv();
+    const names = Object.keys(m.bounds);
+    names.forEach((name, i) => {
+      const raw = this.#colorMask(name, m.bounds[name]);
+      if (i === 0) raw.copyTo(m.mask); else cv.bitwise_or(m.mask, raw, m.mask);
+    });
+    cv.morphologyEx(m.mask, m.mask, cv.MORPH_OPEN, m.openKernel, new cv.Point(-1, -1), 1);
+    cv.morphologyEx(m.mask, m.mask, cv.MORPH_CLOSE, m.closeKernel, new cv.Point(-1, -1), 2);
+    if (this.debugCanvas) {
+      // tuning one color: show just its raw mask; otherwise what the blobs come from
+      cv.imshow(this.debugCanvas, m.colorMasks[this.debugColor] ?? m.mask);
+    }
+    return this.#findNotes(m.mask, (contour, contours, index) => this.#blobColor(contour, contours, index));
+  }
+
+  // The color with the most pixels inside contour `index`.
+  #blobColor(contour, contours, index) {
+    const cv = globalThis.cv;
+    const m = this.mats;
+    const r = cv.boundingRect(contour);
+    m.blob.delete();
+    m.blob = cv.Mat.zeros(r.height, r.width, cv.CV_8UC1);
+    cv.drawContours(m.blob, contours, index, new cv.Scalar(255), -1, cv.LINE_8,
+      m.none, 0, new cv.Point(-r.x, -r.y));
+    let best = null, bestCount = -1;
+    for (const [name, mask] of Object.entries(m.colorMasks)) {
+      const roi = mask.roi(r);
+      try {
+        cv.bitwise_and(roi, m.blob, m.hit);
+        const count = cv.countNonZero(m.hit);
+        if (count > bestCount) { best = name; bestCount = count; }
+      } finally {
+        roi.delete();
+      }
+    }
+    return best;
+  }
+
+  // classify(contour, contours, index) -> color name, called for each note kept
+  #findNotes(mask, classify) {
     const cv = globalThis.cv;
     const contours = new cv.MatVector();
     const hierarchy = new cv.Mat();
@@ -307,6 +386,7 @@ export class NoteDetector {
             const outline = [];
             for (let i = 0; i < hull.rows; i++) outline.push({ x: h[i * 2] * k, y: h[i * 2 + 1] * k });
             found.push({
+              color: classify?.(contour, contours, index),
               center,
               size,
               angle: rect.angle,
@@ -358,7 +438,7 @@ export class NoteDetector {
     this.lastDetectAt = now;
 
     this.#ensureMats();
-    this.notes = this.#findNotes(this.#makeMask());
+    this.notes = this.#detect();
     this.frameCount += 1;
     this.detectMs = performance.now() - now;
     this.onUpdate?.(this.notes);
@@ -372,7 +452,9 @@ export class NoteDetector {
     }
     this.stream?.getTracks().forEach((track) => track.stop());
     if (this.mats) {
-      for (const mat of Object.values(this.mats)) mat?.delete();
+      this.#deleteBounds();
+      const { bounds, colorMasks, ...mats } = this.mats;
+      for (const mat of Object.values(mats)) mat?.delete();
       this.mats = null;
       this.boundsKey = "";
     }
@@ -380,6 +462,22 @@ export class NoteDetector {
     this.video = null;
     this.notes = [];
   }
+}
+
+/**
+ * Starting HSV windows (OpenCV: H 0-179). Tune on the real wall with the panel.
+ *   pink   magenta..red, wraps past 179 (hue2)
+ *   green  yellow-green..green. Starts above 25 so yellow/orange (calibration
+ *          dots, "NEW BEST") is not green.
+ *   blue   cyan..blue
+ * Never project a color inside one of these: the camera would see it as a note.
+ */
+export function defaultColors() {
+  return {
+    pink: { lower: [140, 70, 70], upper: [179, 255, 255], hue2: [0, 10] },
+    green: { lower: [30, 60, 60], upper: [85, 255, 255], hue2: null },
+    blue: { lower: [88, 80, 60], upper: [128, 255, 255], hue2: null },
+  };
 }
 
 /**

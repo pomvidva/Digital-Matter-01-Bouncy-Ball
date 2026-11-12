@@ -23,7 +23,10 @@ const BEST_KEY = "bouncy.best";
 const CHUTE_Y = 70;
 const CUP_H = 110, CUP_WALL = 14;
 const WALL_T = 24;              // obstacle thickness, px
-const CUP_COLOR = "#7cf29a", WALL_COLOR = "#8aa0b8", MISS_COLOR = "#445060";
+// Cups are big filled shapes on the projected image, so their color must stay
+// outside every note color's HSV window (pink/green/blue in note_detector.js),
+// or the camera sees them as notes. Amber is H~20, between pink and green.
+const CUP_COLOR = "#ffb000", WALL_COLOR = "#8aa0b8", MISS_COLOR = "#445060";
 
 // Levels, easy -> hard. Positions are fractions of the screen (x of width, y of
 // height) so they fit any projector. chute = drop x, cup = { fx, w: inner px },

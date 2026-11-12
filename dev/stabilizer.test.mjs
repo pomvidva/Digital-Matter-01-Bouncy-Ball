@@ -120,3 +120,34 @@ test("outline is preferred over corners", () => {
   const c = s.stable[0].center;
   assert.ok(Math.abs(c.x - 100) < 1e-6 && Math.abs(c.y - 100) < 1e-6);
 });
+
+test("each note keeps its color", () => {
+  const s = new NoteStabilizer();
+  const pink = { ...rectNote(200, 300, 100, 100), color: "pink" };
+  const blue = { ...rectNote(600, 300, 100, 100), color: "blue" };
+  for (let i = 0; i < 4; i++) s.update([pink, blue]);
+  assert.deepEqual(s.stable.map((n) => n.color).sort(), ["blue", "pink"]);
+});
+
+test("a one-frame color flicker does not repaint or move the wall", () => {
+  const s = new NoteStabilizer();
+  const note = (color) => ({ ...rectNote(400, 300, 120, 120), color });
+  for (let i = 0; i < 4; i++) s.update([note("pink")]);
+  const before = s.stable;
+  s.update([note("blue")]);                  // misread once
+  for (let i = 0; i < 3; i++) s.update([note("pink")]);
+  assert.deepEqual(s.stable, before);        // same id, version and color, no blue wall
+});
+
+test("notes of different colors never swap walls", () => {
+  const s = new NoteStabilizer();
+  for (let i = 0; i < 4; i++) {
+    s.update([{ ...rectNote(300, 300, 100, 100), color: "green" }, { ...rectNote(340, 300, 100, 100), color: "pink" }]);
+  }
+  const byColor = Object.fromEntries(s.stable.map((n) => [n.color, n.id]));
+  // they move toward each other's old spot: the color, not distance, decides
+  for (let i = 0; i < 4; i++) {
+    s.update([{ ...rectNote(330, 300, 100, 100), color: "green" }, { ...rectNote(310, 300, 100, 100), color: "pink" }]);
+  }
+  assert.deepEqual(Object.fromEntries(s.stable.map((n) => [n.color, n.id])), byColor);
+});

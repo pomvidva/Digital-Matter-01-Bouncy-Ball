@@ -20,9 +20,16 @@
 //   onPointer(e)             left click (not calibration, not shift+drag);
 //                            return true = handled, core won't drop a ball
 //   onNoteHit(note, ball, speed)   a ball started touching a note body
+//                            (note.plugin.color = "pink" | "green" | "blue")
+//
+// Note colors (rules in note_behaviors.js): pink = wall, green = bouncier wall,
+// blue = portal to the other blue note (only with exactly 2 blue notes).
 
 import { NoteDetector } from "./note_detector.js";
 import { NoteStabilizer } from "./note_stabilizer.js";
+import {
+  NOTE_COLORS, RESTITUTION, PORTAL_COOLDOWN_MS, portalsActive, portalExit,
+} from "./note_behaviors.js";
 import projects from "../projects.js";
 
 export function start({ project = {} } = {}) {
@@ -33,13 +40,14 @@ export function start({ project = {} } = {}) {
     <canvas id="mask"></canvas>
 
     <div id="panel">
-      <h1>${project.title ?? "🎀 Pink note tuner"}</h1>
+      <h1>${project.title ?? "🎀 Note tuner"}</h1>
       <div id="pages"></div>
       <div id="stat">notes: 0 · balls: 0</div>
+      <div id="tunecolors"></div>
       <div class="row"><label>H min</label><input id="hmin" type="range" min="0" max="179" value="140"><span id="hminV">140</span></div>
       <div class="row"><label>H max</label><input id="hmax" type="range" min="0" max="179" value="179"><span id="hmaxV">179</span></div>
-      <div class="row"><label>H2 min</label><input id="h2min" type="range" min="0" max="179" value="0"><span id="h2minV">0</span></div>
-      <div class="row"><label>H2 max</label><input id="h2max" type="range" min="0" max="179" value="10"><span id="h2maxV">10</span></div>
+      <div class="row h2"><label>H2 min</label><input id="h2min" type="range" min="0" max="179" value="0"><span id="h2minV">0</span></div>
+      <div class="row h2"><label>H2 max</label><input id="h2max" type="range" min="0" max="179" value="10"><span id="h2maxV">10</span></div>
       <div class="row"><label>S min</label><input id="smin" type="range" min="0" max="255" value="70"><span id="sminV">70</span></div>
       <div class="row"><label>S max</label><input id="smax" type="range" min="0" max="255" value="255"><span id="smaxV">255</span></div>
       <div class="row"><label>V min</label><input id="vmin" type="range" min="0" max="255" value="70"><span id="vminV">70</span></div>
@@ -47,6 +55,7 @@ export function start({ project = {} } = {}) {
       <div class="keys">
         ${project.help ?? "<b>click</b> drop ball · <b>space</b> drop at top"}<br>
         <b>shift+drag</b> fake note · <b>right-click</b> delete it · <b>n</b> clear fakes<br>
+        <b>k</b> fake note color: <span id="fakecolor">pink</span><br>
         <b>m</b> mask view · <b>v</b> feed · <b>o</b> outlines<br>
         <b>p</b> projector mode · <b>h</b> hide panel<br>
         <b>c</b> calibrate · <b>shift+c</b> cancel (or reset saved)<br>
@@ -126,15 +135,41 @@ export function start({ project = {} } = {}) {
     Composite.remove(world, Composite.allBodies(world).filter(b => b.label === "ball"));
   }
 
-  // ball <-> note contacts, for projects (sounds, glow, scoring...)
+  // ball <-> note contacts: blue notes queue a warp, and projects hear about
+  // every contact (sounds, glow, scoring...)
+  const portalQueue = [];   // { ball, from } waiting for the end of the physics step
   Matter.Events.on(engine, "collisionStart", (e) => {
-    if (!project.onNoteHit) return;
     for (const { bodyA: a, bodyB: b } of e.pairs) {
       const note = a.label === "note" ? a : b.label === "note" ? b : null;
       const ball = a.label === "ball" ? a : b.label === "ball" ? b : null;
-      if (note && ball) project.onNoteHit(note, ball, ball.speed);
+      if (!note || !ball) continue;
+      if (note.plugin.color === "blue") portalQueue.push({ ball, from: note });
+      project.onNoteHit?.(note, ball, ball.speed);
     }
   });
+
+  const blueNotes = () => noteBodies.filter((b) => b.plugin.color === "blue");
+
+  // Move queued balls to the other blue note. Runs between engine steps, never
+  // inside the collision event (moving a body mid-solve confuses Matter).
+  function runPortals() {
+    if (!portalQueue.length) return;
+    const blues = blueNotes();
+    const now = engine.timing.timestamp;
+    for (const { ball, from } of portalQueue.splice(0)) {
+      if (!portalsActive(blues.length) || !blues.includes(from)) continue;
+      if (now < (ball.portalUntil ?? 0)) continue;   // just came out of a portal
+      const to = blues.find((b) => b !== from);
+      const out = portalExit({
+        from: { center: from.position, poly: from.vertices },
+        to: { center: to.position, poly: to.vertices },
+        vel: ball.velocity, radius: ball.circleRadius,
+      });
+      Body.setPosition(ball, out.position);
+      Body.setVelocity(ball, out.velocity);
+      ball.portalUntil = now + PORTAL_COOLDOWN_MS;
+    }
+  }
 
   // ---------- camera->canvas mapping (contain + optional mirror) ----------
   let layout = { s: 1, ox: 0, oy: 0, camW: 1, camH: 1 };
@@ -157,13 +192,19 @@ export function start({ project = {} } = {}) {
   let lastDetection = null;    // detector.notes is a new array per detection
   let lastCal;                 // calibration.H the walls were made with
 
-  // convex polygon (screen px) -> static Matter body with exactly that shape
-  function polyBody(poly) {
+  // convex polygon (screen px) -> static Matter body with exactly that shape.
+  // Blue is a sensor: balls pass into it (and get warped) instead of bouncing.
+  function polyBody(poly, color = "pink") {
     const vertices = Matter.Vertices.clockwiseSort(poly.map((p) => ({ x: p.x, y: p.y })));
-    return Body.create({
+    const body = Body.create({
       position: Matter.Vertices.centre(vertices), vertices,
-      isStatic: true, restitution: 0.9, label: "note",
+      isStatic: true, label: "note",
+      isSensor: color === "blue",
+      plugin: { color },
     });
+    // after create: isStatic resets restitution to 0 (see note_behaviors.js)
+    if (RESTITUTION[color] != null) body.restitution = RESTITUTION[color];
+    return body;
   }
 
   // ---------- notes in screen px (the A -> B contract) ----------
@@ -186,7 +227,7 @@ export function start({ project = {} } = {}) {
       cam = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => (
         { x: n.center.x + x * cos - y * sin, y: n.center.y + x * sin + y * cos }));
     }
-    const note = { corners: cam.map(camToScreen), center: camToScreen(n.center) };
+    const note = { corners: cam.map(camToScreen), center: camToScreen(n.center), color: n.color };
     if (n.outline) note.outline = n.outline.map(camToScreen);
     return note;
   }
@@ -195,13 +236,15 @@ export function start({ project = {} } = {}) {
   const FAKE_THICKNESS = 40;
   let fakeNotes = [];
   let drag = null;   // { x0, y0, x1, y1 } while shift-dragging
+  let fakeColor = "pink";   // `k` cycles it; new fake notes get this color
 
-  function makeFakeNote(x0, y0, x1, y1) {
+  function makeFakeNote(x0, y0, x1, y1, color) {
     const len = Math.max(30, Math.hypot(x1 - x0, y1 - y0));
     const ang = Math.atan2(y1 - y0, x1 - x0);
     const ux = Math.cos(ang), uy = Math.sin(ang), vx = -uy, vy = ux;
     const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, hl = len / 2, ht = FAKE_THICKNESS / 2;
     return {
+      color,
       center: { x: cx, y: cy },
       corners: [[-hl, -ht], [hl, -ht], [hl, ht], [-hl, ht]].map(([l, t]) => (
         { x: cx + ux * l + vx * t, y: cy + uy * l + vy * t })),
@@ -226,7 +269,7 @@ export function start({ project = {} } = {}) {
         const wall = noteWalls.get(n.id);
         if (wall?.version === n.version) continue;   // same shape: leave the body alone
         if (wall) Composite.remove(world, wall.body);
-        const body = polyBody(n.poly);
+        const body = polyBody(n.poly, n.color);
         Composite.add(world, body);
         noteWalls.set(n.id, { version: n.version, body });
         changed = true;
@@ -242,7 +285,7 @@ export function start({ project = {} } = {}) {
     if (fakesDirty) {
       fakesDirty = false;
       Composite.remove(world, fakeBodies);
-      fakeBodies = fakeNotes.map((n) => polyBody(n.corners));
+      fakeBodies = fakeNotes.map((n) => polyBody(n.corners, n.color));
       Composite.add(world, fakeBodies);
       changed = true;
     }
@@ -258,35 +301,74 @@ export function start({ project = {} } = {}) {
   const detector = new NoteDetector({
     camera: savedCamera,
     debugCanvas: maskCanvas,
-    lower: [140, 70, 70],
-    upper: [179, 255, 255],
   });
 
   // ---------- tuner wiring ----------
-  // saved per site, so every page shares the same color settings
+  // One set of sliders; the color tabs pick which note color they edit (and
+  // which color the `m` mask view shows). Saved per site, so every page shares
+  // the same color settings.
   const ids = ["hmin","hmax","h2min","h2max","smin","smax","vmin","vmax"];
-  const TUNER_KEY = "bouncy.tuner";
+  const TUNER_KEY = "bouncy.tuner.v2";   // { pink: {lower, upper, hue2}, green: ..., blue: ... }
+  const OLD_TUNER_KEY = "bouncy.tuner";  // pink-only slider values from before colors
+  const SWATCH = { pink: "#ff7fbf", green: "#7cf29a", blue: "#00e5ff" };
+  let tuneColor = "pink";
+
+  const tabs = document.getElementById("tunecolors");
+  for (const c of NOTE_COLORS) {
+    const b = document.createElement("button");
+    b.textContent = c;
+    b.dataset.color = c;
+    b.style.setProperty("--swatch", SWATCH[c]);
+    b.addEventListener("click", () => { tuneColor = c; showTuner(); });
+    tabs.append(b);
+  }
+
+  // detector -> sliders, for the selected color
+  function showTuner() {
+    const { lower, upper, hue2 } = detector.colors[tuneColor];
+    const v = { hmin: lower[0], smin: lower[1], vmin: lower[2],
+                hmax: upper[0], smax: upper[1], vmax: upper[2],
+                h2min: hue2?.[0] ?? 0, h2max: hue2?.[1] ?? 0 };
+    for (const id of ids) {
+      document.getElementById(id).value = v[id];
+      document.getElementById(id + "V").textContent = v[id];
+    }
+    // only pink wraps past 179, so only pink has the second hue window
+    for (const row of panel.querySelectorAll(".row.h2")) row.style.display = hue2 ? "" : "none";
+    for (const b of tabs.children) b.classList.toggle("here", b.dataset.color === tuneColor);
+    detector.debugColor = tuneColor;
+  }
+  // sliders -> detector, for the selected color
   function readTuner() {
     const g = (id) => +document.getElementById(id).value;
-    detector.lower = [g("hmin"), g("smin"), g("vmin")];
-    detector.upper = [g("hmax"), g("smax"), g("vmax")];
-    // second hue range (pink that wraps past 179 into 0..); shares S/V with the first
-    detector.hue2 = [g("h2min"), g("h2max")];
+    const c = detector.colors[tuneColor];
+    c.lower = [g("hmin"), g("smin"), g("vmin")];
+    c.upper = [g("hmax"), g("smax"), g("vmax")];
+    if (c.hue2) c.hue2 = [g("h2min"), g("h2max")];
   }
   function saveTuner() {
-    try {
-      localStorage.setItem(TUNER_KEY, JSON.stringify(Object.fromEntries(
-        ids.map((id) => [id, document.getElementById(id).value]))));
-    } catch { /* storage blocked: sliders just won't persist */ }
+    try { localStorage.setItem(TUNER_KEY, JSON.stringify(detector.colors)); }
+    catch { /* storage blocked: sliders just won't persist */ }
   }
   function loadTuner() {
+    const isHsv = (a) => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
     try {
-      const saved = JSON.parse(localStorage.getItem(TUNER_KEY) || "{}");
-      for (const id of ids) {
-        if (saved[id] === undefined) continue;
-        document.getElementById(id).value = saved[id];
-        document.getElementById(id + "V").textContent = saved[id];
+      const saved = JSON.parse(localStorage.getItem(TUNER_KEY) || "null");
+      if (saved) {
+        for (const c of NOTE_COLORS) {
+          const s = saved[c];
+          if (!s || !isHsv(s.lower) || !isHsv(s.upper)) continue;
+          detector.colors[c] = { lower: s.lower, upper: s.upper, hue2: s.hue2 ?? null };
+        }
+        return;
       }
+      // first run after the color update: keep the pink the user already tuned
+      const old = JSON.parse(localStorage.getItem(OLD_TUNER_KEY) || "{}");
+      if (old.hmin === undefined) return;
+      const n = (id) => +old[id];
+      const pink = { lower: [n("hmin"), n("smin"), n("vmin")], upper: [n("hmax"), n("smax"), n("vmax")],
+                     hue2: [n("h2min"), n("h2max")] };
+      if (isHsv(pink.lower) && isHsv(pink.upper)) detector.colors.pink = pink;
     } catch { /* ignore corrupt/blocked storage */ }
   }
   ids.forEach((id) => {
@@ -295,6 +377,7 @@ export function start({ project = {} } = {}) {
     el.addEventListener("input", () => { out.textContent = el.value; readTuner(); saveTuner(); });
   });
   loadTuner();
+  showTuner();
 
   // ---------- fixed-timestep physics ----------
   // Step by real elapsed time so speed doesn't depend on display refresh rate or
@@ -307,6 +390,7 @@ export function start({ project = {} } = {}) {
     const balls = Composite.allBodies(world).filter(b => b.label === "ball");
     while (acc >= STEP_MS) {
       Engine.update(engine, STEP_MS);
+      runPortals();
       for (const b of balls) {
         const sp = Math.hypot(b.velocity.x, b.velocity.y);
         if (sp > MAX_SPEED) Body.setVelocity(b, { x: b.velocity.x * MAX_SPEED / sp, y: b.velocity.y * MAX_SPEED / sp });
@@ -348,22 +432,29 @@ export function start({ project = {} } = {}) {
       ctx.restore();
     }
 
-    // note collision boxes. Cyan, never pink: the camera would detect projected
-    // pink as a note, and that fake note would never go away.
+    // note collision boxes, in the note's color on the screen but plain white in
+    // projector mode: projected pink/green/cyan would be detected as a note by
+    // the camera, and that fake note would never go away. Portals are dashed.
     if (view.outlines) {
-      // thin grey: what the camera sees this instant; thick cyan: the locked wall.
+      // thin grey: what the camera sees this instant; thick: the locked wall.
       // Hidden in projector mode so the camera never sees it.
       if (!view.projector) {
         ctx.lineWidth = 1; ctx.strokeStyle = "#8a96a3";
         for (const n of rawNotes) drawPoly(n.outline ?? n.corners);
       }
-      ctx.lineWidth = 3; ctx.strokeStyle = "#00e5ff";
-      for (const b of noteBodies) drawBody(b);
+      ctx.save(); ctx.lineWidth = 3;
+      for (const b of noteBodies) {
+        ctx.strokeStyle = view.projector ? "#fff" : SWATCH[b.plugin.color] ?? "#fff";
+        ctx.setLineDash(b.plugin.color === "blue" ? [10, 6] : []);
+        drawBody(b);
+      }
+      ctx.restore();
     }
 
     // fake note being dragged
     if (drag) {
-      ctx.save(); ctx.setLineDash([8, 8]); ctx.lineWidth = 2; ctx.strokeStyle = "#00e5ff";
+      ctx.save(); ctx.setLineDash([8, 8]); ctx.lineWidth = 2;
+      ctx.strokeStyle = view.projector ? "#fff" : SWATCH[fakeColor];
       ctx.beginPath(); ctx.moveTo(drag.x0, drag.y0); ctx.lineTo(drag.x1, drag.y1); ctx.stroke();
       ctx.restore();
     }
@@ -388,7 +479,11 @@ export function start({ project = {} } = {}) {
       perf.frames = perf.detects = 0; perf.t0 = t;
     }
     const notesInfo = stabilizer.locked ? "🔒 notes locked" : `jitter ${stabilizer.jitter.toFixed(1)}px`;
-    stat.textContent = `notes: ${noteBodies.length} · ${notesInfo} · balls: ${nBalls} · ${perf.text}` + (flash ? `\n${flash}` : "");
+    const nBlue = blueNotes().length;
+    const portalInfo = nBlue === 0 ? ""
+      : portalsActive(nBlue) ? " · 🌀 portal on" : ` · ⚠ portal off: ${nBlue} blue (need 2)`;
+    stat.textContent = `notes: ${noteBodies.length} · ${notesInfo} · balls: ${nBalls} · ${perf.text}${portalInfo}` +
+      (flash ? `\n${flash}` : "");
 
     if (calibrating && calibration) calibration.draw(ctx);
 
@@ -445,7 +540,7 @@ export function start({ project = {} } = {}) {
   canvas.addEventListener("pointerup", () => {
     if (!drag) return;
     if (Math.hypot(drag.x1 - drag.x0, drag.y1 - drag.y0) > 10) {
-      fakeNotes.push(makeFakeNote(drag.x0, drag.y0, drag.x1, drag.y1));
+      fakeNotes.push(makeFakeNote(drag.x0, drag.y0, drag.x1, drag.y1, fakeColor));
       fakesDirty = true;
     }
     drag = null;
@@ -476,6 +571,10 @@ export function start({ project = {} } = {}) {
     else if (k === "h") { view.panel = !view.panel; applyUI(); }
     else if (k === "p") { view.projector = !view.projector; view.panel = !view.projector; applyUI(); }
     else if (k === "n") { fakeNotes = []; fakesDirty = true; }
+    else if (k === "k") {
+      fakeColor = NOTE_COLORS[(NOTE_COLORS.indexOf(fakeColor) + 1) % NOTE_COLORS.length];
+      document.getElementById("fakecolor").textContent = fakeColor;
+    }
     else if (k === "l") {
       stabilizer.locked = !stabilizer.locked;
       flash = stabilizer.locked ? "notes locked: walls won't change (l to unlock)" : "notes follow the camera again";
@@ -572,7 +671,6 @@ export function start({ project = {} } = {}) {
     rebuildWalls();
     stat.textContent = "loading OpenCV…";
     await whenCvReady();
-    readTuner();
     stat.textContent = "starting camera… allow webcam";
     try {
       try {
