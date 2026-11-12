@@ -13,6 +13,8 @@ html, body { margin: 0; height: 100%; background: #05070a; overflow: hidden; fon
 #pages a { color: #8fb; text-decoration: none; border: 1px solid #2c3e52; border-radius: 6px; padding: 2px 7px; }
 #pages a:hover { background: #1b2735; }
 #pages a.here { color: #05070a; background: #8fb; border-color: #8fb; }
+#stream { margin: 0 0 8px; }
+#stream.here { background: #fff; color: #05070a; }
 #tunecolors { display: flex; gap: 6px; margin: 0 0 6px; }
 #tunecolors button { padding: 2px 8px; border-color: var(--swatch); color: var(--swatch); background: transparent; }
 #tunecolors button.here { background: var(--swatch); color: #05070a; }

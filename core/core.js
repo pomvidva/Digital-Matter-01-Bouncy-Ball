@@ -42,6 +42,7 @@ export function start({ project = {} } = {}) {
     <div id="panel">
       <h1>${project.title ?? "🎀 Note tuner"}</h1>
       <div id="pages"></div>
+      <button id="stream">ball stream: off</button>
       <div id="stat">notes: 0 · balls: 0</div>
       <div id="tunecolors"></div>
       <div class="row"><label>H min</label><input id="hmin" type="range" min="0" max="179" value="140"><span id="hminV">140</span></div>
@@ -61,6 +62,7 @@ export function start({ project = {} } = {}) {
         <b>c</b> calibrate · <b>shift+c</b> cancel (or reset saved)<br>
         <b>w</b> switch camera · <b>e</b> lock exposure<br>
         <b>l</b> lock notes (walls stop changing)<br>
+        <b>b</b> ball stream · <b>shift+b</b> move it to the mouse<br>
         <b>x</b> clear balls · <b>f</b> fullscreen
       </div>
     </div>
@@ -125,15 +127,45 @@ export function start({ project = {} } = {}) {
       render: {}, label: "ball",
     });
     Composite.add(world, ball);   // no sideways push: it falls straight down
-    // cap total balls
-    const balls = Composite.allBodies(world).filter(b => b.label === "ball");
-    if (balls.length > 40) Composite.remove(world, balls[0]);
+    // cap total balls: the oldest fades out (see fadeBalls) instead of vanishing
+    const balls = Composite.allBodies(world).filter(b => b.label === "ball" && !b.plugin.fadeAt);
+    if (balls.length > MAX_BALLS) balls[0].plugin.fadeAt = performance.now();
     return ball;
   }
 
   function clearBalls() {
     Composite.remove(world, Composite.allBodies(world).filter(b => b.label === "ball"));
   }
+
+  const MAX_BALLS = 40;
+  const FADE_MS = 600;
+  // remove faded balls; returns a ball's opacity for drawing
+  function fadeBalls(now) {
+    const gone = Composite.allBodies(world).filter(b => b.plugin.fadeAt && now - b.plugin.fadeAt > FADE_MS);
+    if (gone.length) Composite.remove(world, gone);
+  }
+  const ballAlpha = (b, now) => b.plugin.fadeAt ? Math.max(0, 1 - (now - b.plugin.fadeAt) / FADE_MS) : 1;
+
+  // ---------- ball stream: one ball at a time from the same spot ----------
+  const STREAM_MS = 600;   // time between balls: calm, not a waterfall
+  const stream = { on: false, x: null, last: 0 };   // x null = top center
+  let mouseX = null;
+  const streamButton = document.getElementById("stream");
+  function setStream(on) {
+    stream.on = on;
+    streamButton.textContent = `ball stream: ${on ? "on" : "off"}`;
+    streamButton.classList.toggle("here", on);
+  }
+  function runStream(now) {
+    if (!stream.on || now - stream.last < STREAM_MS) return;
+    stream.last = now;
+    // a hair of randomness so balls don't stack in a perfect column
+    dropBall((stream.x ?? canvas.width / 2) + (Math.random() - 0.5) * 2, 30);
+  }
+  streamButton.addEventListener("click", () => {
+    setStream(!stream.on);
+    streamButton.blur();   // else space (drop ball) would press the button again
+  });
 
   // ball <-> note contacts: blue notes queue a warp, and projects hear about
   // every contact (sounds, glow, scoring...)
@@ -412,7 +444,9 @@ export function start({ project = {} } = {}) {
     if (detector.width) computeLayout(detector.width, detector.height);
     syncNoteBodies();
 
+    runStream(performance.now());
     stepPhysics(performance.now());
+    fadeBalls(performance.now());
     project.update?.(performance.now());
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -460,12 +494,15 @@ export function start({ project = {} } = {}) {
     }
 
     // balls
+    const tBalls = performance.now();
     for (const b of Composite.allBodies(world)) {
       if (b.label !== "ball") continue;
+      ctx.globalAlpha = ballAlpha(b, tBalls);
       ctx.beginPath();
       ctx.arc(b.position.x, b.position.y, b.circleRadius, 0, Math.PI * 2);
       ctx.fillStyle = "#fff"; ctx.fill();
     }
+    ctx.globalAlpha = 1;
 
     if (project.draw) { ctx.save(); project.draw(ctx, performance.now()); ctx.restore(); }
 
@@ -534,6 +571,7 @@ export function start({ project = {} } = {}) {
     }
   });
   canvas.addEventListener("pointermove", (e) => {
+    mouseX = e.clientX;
     if (calibrating && calibration) calibration.handleMove(e.clientX, e.clientY);   // zoom loupe
     if (drag) { drag.x1 = e.clientX; drag.y1 = e.clientY; }
   });
@@ -590,6 +628,11 @@ export function start({ project = {} } = {}) {
     }
     else if (k === "w") switchCamera();
     else if (k === "e") toggleCameraLock();
+    else if (e.key === "B") {
+      stream.x = mouseX;   // null (mouse not over the canvas yet) = top center
+      setStream(true);
+    }
+    else if (k === "b") setStream(!stream.on);
     else if (k === "x") clearBalls();
     else if (k === "f") document.documentElement.requestFullscreen?.();
   });
