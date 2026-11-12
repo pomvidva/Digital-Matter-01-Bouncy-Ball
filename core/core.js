@@ -22,13 +22,14 @@
 //   onNoteHit(note, ball, speed)   a ball started touching a note body
 //                            (note.plugin.color = "pink" | "green" | "blue")
 //
-// Note colors (rules in note_behaviors.js): pink = wall, green = bouncier wall,
+// Note colors (rules in note_behaviors.js): pink = wall, green = launch pad,
 // blue = portal to the other blue note (only with exactly 2 blue notes).
 
 import { NoteDetector } from "./note_detector.js";
 import { NoteStabilizer } from "./note_stabilizer.js";
 import {
   NOTE_COLORS, RESTITUTION, PORTAL_COOLDOWN_MS, portalsActive, portalExit,
+  outwardNormal, greenLaunch,
 } from "./note_behaviors.js";
 import projects from "../projects.js";
 
@@ -176,9 +177,35 @@ export function start({ project = {} } = {}) {
       const ball = a.label === "ball" ? a : b.label === "ball" ? b : null;
       if (!note || !ball) continue;
       if (note.plugin.color === "blue") portalQueue.push({ ball, from: note });
+      if (note.plugin.color === "green") launchQueue.push({ ball, pad: note });
       project.onNoteHit?.(note, ball, ball.speed);
     }
   });
+
+  // Shoot queued balls off their green note (after the step, like portals), and
+  // leave a ring where it happened so the launch is easy to see.
+  const launchQueue = [];   // { ball, pad }
+  const LAUNCH_RING_MS = 450;
+  let launchRings = [];     // { x, y, t0 }
+  function runLaunches() {
+    for (const { ball, pad } of launchQueue.splice(0)) {
+      const normal = outwardNormal(pad.vertices, ball.position);
+      Body.setVelocity(ball, greenLaunch({ vel: ball.velocity, normal }));
+      launchRings.push({ x: ball.position.x, y: ball.position.y, t0: performance.now() });
+    }
+  }
+  function drawLaunchRings(now) {
+    launchRings = launchRings.filter((r) => now - r.t0 < LAUNCH_RING_MS);
+    ctx.save(); ctx.lineWidth = 3;
+    for (const r of launchRings) {
+      const k = (now - r.t0) / LAUNCH_RING_MS;
+      // white in projector mode: projected green would be detected as a note
+      ctx.strokeStyle = view.projector ? "#fff" : SWATCH.green;
+      ctx.globalAlpha = 1 - k;
+      ctx.beginPath(); ctx.arc(r.x, r.y, 20 + 40 * k, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
 
   const blueNotes = () => noteBodies.filter((b) => b.plugin.color === "blue");
 
@@ -423,6 +450,7 @@ export function start({ project = {} } = {}) {
     while (acc >= STEP_MS) {
       Engine.update(engine, STEP_MS);
       runPortals();
+      runLaunches();
       for (const b of balls) {
         const sp = Math.hypot(b.velocity.x, b.velocity.y);
         if (sp > MAX_SPEED) Body.setVelocity(b, { x: b.velocity.x * MAX_SPEED / sp, y: b.velocity.y * MAX_SPEED / sp });
@@ -503,6 +531,7 @@ export function start({ project = {} } = {}) {
       ctx.fillStyle = "#fff"; ctx.fill();
     }
     ctx.globalAlpha = 1;
+    drawLaunchRings(tBalls);
 
     if (project.draw) { ctx.save(); project.draw(ctx, performance.now()); ctx.restore(); }
 

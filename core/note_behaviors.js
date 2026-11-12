@@ -3,7 +3,8 @@
  * runs under `node --test` (dev/behaviors.test.mjs).
  *
  *   pink   normal wall
- *   green  bouncier wall
+ *   green  launch pad: a ball that touches one is shot away from it at
+ *          GREEN_LAUNCH speed or more, so it keeps bouncing like a trampoline
  *   blue   portal: a ball that touches one comes out of the other blue note,
  *          turned by the difference between the two notes' angles. Works only
  *          when there are exactly 2 blue notes.
@@ -20,6 +21,10 @@ export const NOTE_COLORS = ["pink", "green", "blue"];
 // Green 0.9: first bounce ~26% higher than pink from the same drop, still dies down
 // (0.95 = +41%, 1.0 = +57% and barely loses height).
 export const RESTITUTION = { pink: null, green: 0.9 };
+
+// Speed a green note shoots a ball away with (Matter velocity units, px per
+// 1/60 s). Bounciness alone (0.9) was too close to pink to notice.
+export const GREEN_LAUNCH = 18;
 
 export const PORTAL_COOLDOWN_MS = 300; // a ball can't warp again this soon
 const SLOW = 1;                        // px/step: slower than this has no direction
@@ -93,4 +98,36 @@ export function portalExit({ from, to, vel, radius }) {
     position: { x: to.center.x + dir.x * dist, y: to.center.y + dir.y * dist },
     velocity: v,
   };
+}
+
+/**
+ * Unit normal of the polygon edge nearest to point `p`, pointing out of the
+ * polygon (towards `p` when `p` is outside).
+ */
+export function outwardNormal(poly, p) {
+  let best = null, bestD = Infinity;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const ex = b.x - a.x, ey = b.y - a.y, len2 = ex * ex + ey * ey || 1;
+    const t = Math.max(0, Math.min(1, ((p.x - a.x) * ex + (p.y - a.y) * ey) / len2));
+    const d = Math.hypot(p.x - (a.x + t * ex), p.y - (a.y + t * ey));
+    if (d < bestD) { bestD = d; best = { ex, ey }; }
+  }
+  const len = Math.hypot(best.ex, best.ey) || 1;
+  let n = { x: -best.ey / len, y: best.ex / len };
+  // flip to point away from the polygon's middle
+  const c = poly.reduce((s, q) => ({ x: s.x + q.x / poly.length, y: s.y + q.y / poly.length }), { x: 0, y: 0 });
+  if ((p.x - c.x) * n.x + (p.y - c.y) * n.y < 0) n = { x: -n.x, y: -n.y };
+  return n;
+}
+
+/**
+ * Velocity of a ball after a green note launches it: the part moving away from
+ * the note is raised to at least `speed`; the sideways part is kept, so a ball
+ * hitting at a slant still leaves at a slant.
+ */
+export function greenLaunch({ vel, normal, speed = GREEN_LAUNCH }) {
+  const away = vel.x * normal.x + vel.y * normal.y;
+  if (away >= speed) return { ...vel };
+  return { x: vel.x + normal.x * (speed - away), y: vel.y + normal.y * (speed - away) };
 }

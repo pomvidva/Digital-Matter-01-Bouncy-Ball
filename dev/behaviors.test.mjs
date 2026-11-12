@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   noteAngle, wrapQuarter, rotate, rayToEdge, portalExit, portalsActive, RESTITUTION,
+  outwardNormal, greenLaunch, GREEN_LAUNCH,
 } from "../core/note_behaviors.js";
 
 const deg = (d) => (d * Math.PI) / 180;
@@ -83,4 +84,28 @@ test("portals need exactly two blue notes", () => {
 test("pink keeps the ball's own bounce; green beats the ball's 0.8", () => {
   assert.equal(RESTITUTION.pink, null);
   assert.ok(RESTITUTION.green > 0.8 && RESTITUTION.green < 1);
+});
+
+test("outwardNormal points from the nearest edge towards the ball", () => {
+  const sq = square(0, 0, 100);
+  const up = outwardNormal(sq, { x: 10, y: -70 });
+  close(up.x, 0); close(up.y, -1);
+  const right = outwardNormal(sq, { x: 80, y: 5 });
+  close(right.x, 1); close(right.y, 0);
+  // winding doesn't matter
+  const flipped = outwardNormal([...sq].reverse(), { x: 10, y: -70 });
+  close(flipped.x, 0); close(flipped.y, -1);
+});
+
+test("green launches a falling ball back up at GREEN_LAUNCH, keeping sideways speed", () => {
+  // after Matter's bounce the ball moves up a little; green raises it to full speed
+  const v = greenLaunch({ vel: { x: 3, y: -2 }, normal: { x: 0, y: -1 } });
+  close(v.x, 3); close(v.y, -GREEN_LAUNCH);
+  // even a ball still moving into the pad leaves at full speed
+  close(greenLaunch({ vel: { x: 0, y: 5 }, normal: { x: 0, y: -1 } }).y, -GREEN_LAUNCH);
+});
+
+test("green never slows a ball that is already leaving faster", () => {
+  const v = greenLaunch({ vel: { x: 0, y: -(GREEN_LAUNCH + 5) }, normal: { x: 0, y: -1 } });
+  close(v.y, -(GREEN_LAUNCH + 5));
 });
