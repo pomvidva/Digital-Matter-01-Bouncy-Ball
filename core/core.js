@@ -43,6 +43,7 @@ export function start({ project = {} } = {}) {
       <div class="row"><label>S max</label><input id="smax" type="range" min="0" max="255" value="255"><span id="smaxV">255</span></div>
       <div class="row"><label>V min</label><input id="vmin" type="range" min="0" max="255" value="70"><span id="vminV">70</span></div>
       <div class="row"><label>V max</label><input id="vmax" type="range" min="0" max="255" value="255"><span id="vmaxV">255</span></div>
+      <div class="row"><label>Hold</label><input id="hold" type="range" min="0" max="15" value="3"><span id="holdV">3</span></div>
       <div class="keys">
         ${project.help ?? "<b>click</b> drop ball · <b>space</b> drop at top"}<br>
         <b>shift+drag</b> fake note · <b>right-click</b> delete it · <b>n</b> clear fakes<br>
@@ -148,7 +149,9 @@ export function start({ project = {} } = {}) {
   const MATCH_DIST = 60;   // px: max distance to count as "the same note"
   const MAX_MISSING = 5;   // detections a note may vanish before its body is removed
   const MIN_NOTE = 12;     // px: minimum note thickness
-  let tracks = [];         // { body, missing }
+  const SETTLE = 3;        // detections in a row a note must look moved before its body follows
+  let holdProc = 3;        // "Hold" slider: corners moving less than this stay frozen, in detection px
+  let tracks = [];         // { body, missing, corners, pending }
   let purge = false;       // true -> unmatched bodies are removed at once (a fake note was deleted)
   let lastNotes = null;   // detector.notes is a new array per detection -> identity change = new detection
 
@@ -187,18 +190,39 @@ export function start({ project = {} } = {}) {
       cam = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => (
         { x: n.center.x + x * cos - y * sin, y: n.center.y + x * sin + y * cos }));
     }
-    return { corners: cam.map(camToScreen), center: camToScreen(n.center) };
+    const center = camToScreen(n.center);
+    return { corners: cam.map(camToScreen), center, hold: screenHold(n.center, center) };
   }
 
   // contract note -> rectangle for the physics body (x, y, w, h, angle)
   function noteGeom(n) {
-    const [a, b, c] = n.corners;
+    // all 4 corners count, so one off corner can't tilt or shift the whole box
+    const [a, b, c, d] = n.corners;
     return [
-      n.center.x, n.center.y,
-      Math.max(MIN_NOTE, Math.hypot(b.x - a.x, b.y - a.y)),   // >= 12px so balls can't tunnel
-      Math.max(MIN_NOTE, Math.hypot(c.x - b.x, c.y - b.y)),
-      Math.atan2(b.y - a.y, b.x - a.x),
+      (a.x + b.x + c.x + d.x) / 4, (a.y + b.y + c.y + d.y) / 4,
+      Math.max(MIN_NOTE, (Math.hypot(b.x - a.x, b.y - a.y) + Math.hypot(c.x - d.x, c.y - d.y)) / 2),   // >= 12px so balls can't tunnel
+      Math.max(MIN_NOTE, (Math.hypot(c.x - b.x, c.y - b.y) + Math.hypot(d.x - a.x, d.y - a.y)) / 2),
+      Math.atan2((b.y - a.y) + (c.y - d.y), (b.x - a.x) + (c.x - d.x)),
     ];
+  }
+
+  // Detection wobbles even when a note sits still, which made bounces unpredictable.
+  // The wobble is whole detection pixels, and on a wall one of those covers many
+  // screen px, so the threshold is measured there and converted for this note.
+  function screenHold(cam, screen) {
+    const step = 1 / (detector.scale || 1);   // one detection px, in camera px
+    const dx = camToScreen({ x: cam.x + step, y: cam.y });
+    const dy = camToScreen({ x: cam.x, y: cam.y + step });
+    return holdProc * Math.max(Math.hypot(dx.x - screen.x, dx.y - screen.y), Math.hypot(dy.x - screen.x, dy.y - screen.y));
+  }
+
+  // True if the corners moved at least `hold` on average from where the body was
+  // last placed: one noisy corner shouldn't count, all of them shifting should.
+  // Nearest-corner matching, so a reordered corner list (minAreaRect flipping its
+  // angle by 90°) doesn't count as movement.
+  function movedEnough(prev, next, hold) {
+    const total = next.reduce((sum, p) => sum + Math.min(...prev.map((q) => Math.hypot(p.x - q.x, p.y - q.y))), 0);
+    return total / next.length >= hold;
   }
 
   // ---------- fake notes (B1): shift+drag a line, it becomes a note along that line ----------
@@ -247,8 +271,16 @@ export function start({ project = {} } = {}) {
     for (const { ti, ni } of pairs) {
       if (usedT.has(ti) || usedN.has(ni)) continue;
       usedT.add(ti); usedN.add(ni);
-      setRect(tracks[ti].body, ...noteGeom(notes[ni]));
-      tracks[ti].missing = 0;
+      const t = tracks[ti], n = notes[ni];
+      // A ball or outline projected over a note glitches its shape for a moment, so
+      // the move must last SETTLE detections. Anything less: keep the body frozen.
+      t.pending = movedEnough(t.corners, n.corners, n.hold ?? 1) ? t.pending + 1 : 0;
+      if (t.pending >= SETTLE) {
+        setRect(t.body, ...noteGeom(n));
+        t.corners = n.corners;
+        t.pending = 0;
+      }
+      t.missing = 0;
     }
 
     // 3. unmatched tracks -> count a miss; remove after MAX_MISSING
@@ -266,7 +298,7 @@ export function start({ project = {} } = {}) {
       const body = Bodies.rectangle(g[0], g[1], g[2], g[3], { isStatic: true, restitution: 0.9, label: "note" });
       setRect(body, ...g);
       Composite.add(world, body);
-      tracks.push({ body, missing: 0 });
+      tracks.push({ body, missing: 0, corners: n.corners, pending: 0 });
     });
     noteBodies = tracks.map((t) => t.body);
   }
@@ -281,7 +313,7 @@ export function start({ project = {} } = {}) {
 
   // ---------- tuner wiring ----------
   // saved per site, so every page shares the same color settings
-  const ids = ["hmin","hmax","h2min","h2max","smin","smax","vmin","vmax"];
+  const ids = ["hmin","hmax","h2min","h2max","smin","smax","vmin","vmax","hold"];
   const TUNER_KEY = "bouncy.tuner";
   function readTuner() {
     const g = (id) => +document.getElementById(id).value;
@@ -289,6 +321,7 @@ export function start({ project = {} } = {}) {
     detector.upper = [g("hmax"), g("smax"), g("vmax")];
     // second hue range (pink that wraps past 179 into 0..); shares S/V with the first
     detector.hue2 = [g("h2min"), g("h2max")];
+    holdProc = g("hold");
   }
   function saveTuner() {
     try {

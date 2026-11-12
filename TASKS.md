@@ -39,12 +39,12 @@ As long as both of you stick to this shape, you can work at the same time withou
 **Owns:** `core/core.js` (was the script inside `index.html`).
 **Branch:** `world`
 
-- [ ] **B1. Fake notes.** Drag with the mouse to create test notes in the contract shape, so no camera is needed yet.
-- [ ] **B2. In-place bodies.** Match notes to existing bodies by nearest center (within about 60px) and move the existing body instead of deleting and re-creating it. Remove a body only after it's been missing for about 5 detections. (Careful: `Body.setVertices` on a static body breaks its infinite mass in Matter.js, so update the vertex x/y, axes and bounds yourself.)
-- [ ] **B3. Steady physics.** Fixed timestep: build up real elapsed time and step at 1/60s, at most 4 steps per frame. Notes at least 12px thick, ball speed capped, so balls don't tunnel through.
-- [ ] **B4. Projector mode.** `p` = black background, no camera feed, no panel, no cursor. `h` = toggle panel, `o` = toggle note outlines. **Outlines cyan, never pink**: the camera would detect projected pink as a note, and that fake note would never disappear.
-- [ ] **B5. Tuner.** Add sliders for the second hue range (H2 min/max) and save all slider values to `localStorage`.
-- [ ] **B6. Hooks for A.** A's side is ready. Wire it up like this:
+- [x] **B1. Fake notes.** Drag with the mouse to create test notes in the contract shape, so no camera is needed yet.
+- [x] **B2. In-place bodies.** Match notes to existing bodies by nearest center (within about 60px) and move the existing body instead of deleting and re-creating it. Remove a body only after it's been missing for about 5 detections. (Careful: `Body.setVertices` on a static body breaks its infinite mass in Matter.js, so update the vertex x/y, axes and bounds yourself.)
+- [x] **B3. Steady physics.** Fixed timestep: build up real elapsed time and step at 1/60s, at most 4 steps per frame. Notes at least 12px thick, ball speed capped, so balls don't tunnel through.
+- [x] **B4. Projector mode.** `p` = black background, no camera feed, no panel, no cursor. `h` = toggle panel, `o` = toggle note outlines. **Outlines cyan, never pink**: the camera would detect projected pink as a note, and that fake note would never disappear.
+- [x] **B5. Tuner.** Add sliders for the second hue range (H2 min/max) and save all slider values to `localStorage`.
+- [x] **B6. Hooks for A.** A's side is ready. Wire it up like this:
   ```js
   import { Calibration } from "./calibration.js";
   const calibration = new Calibration();            // loads the saved one
@@ -62,9 +62,9 @@ As long as both of you stick to this shape, you can work at the same time withou
 
 ## 👥 Together (end of today)
 
-- [ ] **Merge** `eyes` + `world` into `main`; real notes replace fake notes.
+- [x] **Merge** `eyes` + `world` into `main`; real notes replace fake notes.
 - [ ] **Mock-wall test:** webcam pointed at a monitor running projector mode. Calibrate (`c`), put pink notes in front of the screen. Balls should rest on them without jitter, and moving a note should push the balls.
-- [ ] **Reload test:** calibration and slider values are still there.
+- [x] **Reload test:** calibration and slider values are still there.
 
 ## 📽️ Monday checklist
 

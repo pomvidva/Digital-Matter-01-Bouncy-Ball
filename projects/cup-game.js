@@ -307,7 +307,7 @@ export class Game {
     if (now - this.overAt > RESTART_GUARD_MS) {
       const next = !this.passed ? "try again" : last ? "play from level 1" : "next level";
       ctx.fillStyle = "#9ab"; ctx.font = "16px ui-monospace, monospace";
-      ctx.fillText(`space = ${next} · r = replay level · g = leave game`, cx, y);
+      ctx.fillText(`space = ${next} · r = replay level`, cx, y);
     }
     ctx.globalAlpha = 1;
   }

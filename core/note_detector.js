@@ -189,7 +189,7 @@ export class NoteDetector {
     const minArea = this.minArea * this.scale * this.scale;
 
     try {
-      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
 
       for (let index = 0; index < contours.size(); index += 1) {
         const contour = contours.get(index);
@@ -216,14 +216,16 @@ export class NoteDetector {
           const size = { width: width * k, height: height * k };
           // Seen at an angle a note is a quadrilateral, not a rectangle: use its
           // real 4 corners when the outline is clean, the fitted rect otherwise.
-          const quad = this.#quadCorners(contour);
+          // Either way, refit each side to its edge pixels so a bump doesn't tilt it.
+          const seed = this.#quadCorners(contour) ??
+            rectCorners(rect.center, rect.size, rect.angle);
+          const quad = fitQuad(contour.data32S, seed);
           found.push({
             center,
             size,
             angle: rect.angle,
             area: area * k * k,
-            corners: quad ? quad.map((p) => ({ x: p.x * k, y: p.y * k }))
-                          : rectCorners(center, size, rect.angle),
+            corners: quad.map((p) => ({ x: p.x * k, y: p.y * k })),
           });
         } finally {
           contour.delete();
@@ -287,6 +289,71 @@ export class NoteDetector {
     this.video = null;
     this.notes = [];
   }
+}
+
+// Sharpen a rough quad using the contour's pixels: each side becomes a straight
+// line fitted through the pixels along it, and the corners are where the lines
+// cross. Averaging many pixels steadies the corners; pixels far off the side
+// (bumps, fingers, a ball's glow) are left out. Returns `seed` if the fit is unsure.
+export function fitQuad(data, seed, passes = 2) {
+  const side = (q, i) => [q[i], q[(i + 1) % 4]];
+  const shortest = Math.min(...seed.map((_, i) => {
+    const [a, b] = side(seed, i);
+    return Math.hypot(b.x - a.x, b.y - a.y);
+  }));
+  const tol = Math.max(2, shortest * 0.15);
+
+  let quad = seed;
+  for (let pass = 0; pass < passes; pass += 1) {
+    const near = [[], [], [], []];
+    for (let n = 0; n < data.length; n += 2) {
+      const x = data[n], y = data[n + 1];
+      let best = -1, bestD = tol;
+      for (let i = 0; i < 4; i += 1) {
+        const [a, b] = side(quad, i);
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+        const t = ((x - a.x) * dx + (y - a.y) * dy) / (len * len);
+        if (t < 0.12 || t > 0.88) continue;  // corners are rounded by the mask
+        const d = Math.abs((x - a.x) * dy - (y - a.y) * dx) / len;
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      if (best >= 0) near[best].push({ x, y });
+    }
+    if (near.some((pts) => pts.length < 5)) return quad;
+
+    const lines = near.map((pts) => {
+      const first = fitLine(pts);
+      const dist = (p) => Math.abs((p.x - first.x) * first.dy - (p.y - first.y) * first.dx);
+      const kept = [...pts].sort((p, q) => dist(p) - dist(q));
+      return fitLine(kept.slice(0, Math.max(5, Math.ceil(kept.length * 0.75))));
+    });
+    const next = lines.map((line, i) => crossLines(lines[(i + 3) % 4], line));
+    const ok = next.every((p, i) => Number.isFinite(p.x) && Number.isFinite(p.y) &&
+      Math.hypot(p.x - seed[i].x, p.y - seed[i].y) < shortest * 0.5);
+    if (!ok) return quad;
+    quad = next;
+  }
+  return quad;
+}
+
+// Best straight line through points (total least squares): a point + a direction.
+function fitLine(pts) {
+  const x = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+  const y = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+  let xx = 0, yy = 0, xy = 0;
+  for (const p of pts) {
+    xx += (p.x - x) * (p.x - x);
+    yy += (p.y - y) * (p.y - y);
+    xy += (p.x - x) * (p.y - y);
+  }
+  const a = 0.5 * Math.atan2(2 * xy, xx - yy);
+  return { x, y, dx: Math.cos(a), dy: Math.sin(a) };
+}
+
+function crossLines(l, m) {
+  const det = l.dx * m.dy - l.dy * m.dx;
+  const t = ((m.x - l.x) * m.dy - (m.y - l.y) * m.dx) / det;
+  return { x: l.x + t * l.dx, y: l.y + t * l.dy };
 }
 
 /**
